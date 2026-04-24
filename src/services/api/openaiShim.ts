@@ -607,9 +607,10 @@ function convertMessages(
           }
         }
 
-        // Only push assistant message if it has content or tool calls.
-        // Stripped thinking-only blocks from user interruptions are empty and cause 400s.
-        if (assistantMsg.content || assistantMsg.tool_calls?.length) {
+        // Only push assistant message if it has content, tool calls, or reasoning.
+        // Stripped thinking-only blocks from user interruptions are empty, but we still
+        // need to include them if they have reasoning_content for providers like DeepSeek.
+        if (assistantMsg.content || assistantMsg.tool_calls?.length || assistantMsg.reasoning_content) {
           result.push(assistantMsg)
         }
       } else {
@@ -694,6 +695,11 @@ function convertMessages(
           ...(lastAfterPossibleInjection.tool_calls ?? []),
           ...msg.tool_calls,
         ]
+      }
+
+      // Preserve reasoning_content when merging consecutive messages
+      if (msg.reasoning_content && !lastAfterPossibleInjection.reasoning_content) {
+        lastAfterPossibleInjection.reasoning_content = msg.reasoning_content
       }
     } else {
       coalesced.push(msg)
