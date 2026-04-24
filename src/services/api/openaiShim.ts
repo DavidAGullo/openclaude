@@ -515,6 +515,9 @@ function convertMessages(
                 : ''
           })(),
         }
+        if (preserveReasoningContent && (inner as any).reasoning_content) {
+          assistantMsg.reasoning_content = (inner as any).reasoning_content;
+        }
 
         // Providers that validate reasoning continuity (Moonshot: "thinking
         // is enabled but reasoning_content is missing in assistant tool call
@@ -622,7 +625,10 @@ function convertMessages(
           })(),
         }
 
-        if (assistantMsg.content) {
+        if (preserveReasoningContent && (inner as any).reasoning_content) {
+          assistantMsg.reasoning_content = (inner as any).reasoning_content;
+        }
+        if (assistantMsg.content || assistantMsg.reasoning_content) {
           result.push(assistantMsg)
         }
       }
