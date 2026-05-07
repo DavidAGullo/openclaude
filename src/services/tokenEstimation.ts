@@ -146,8 +146,9 @@ export async function countMessagesTokensWithAPI(
       const model = getMainLoopModel()
       const betas = getModelBetas(model)
       const containsThinking = hasThinkingBlocks(messages)
+      const provider = getAPIProvider()
 
-      if (getAPIProvider() === 'bedrock') {
+      if (provider === 'bedrock') {
         // @anthropic-sdk/bedrock-sdk doesn't support countTokens currently
         return countTokensWithBedrock({
           model: normalizeModelStringForAPI(model),
@@ -156,6 +157,12 @@ export async function countMessagesTokensWithAPI(
           betas,
           containsThinking,
         })
+      }
+
+      // OpenAI-compatible providers don't support the Anthropic countTokens API.
+      // Returning null triggers a fallback to rough token estimation.
+      if (!['firstParty', 'vertex', 'foundry'].includes(provider)) {
+        return null
       }
 
       const anthropic = await getAnthropicClient({
@@ -395,6 +402,14 @@ export async function countTokensViaHaikuFallback(
   messages: Anthropic.Beta.Messages.BetaMessageParam[],
   tools: Anthropic.Beta.Messages.BetaToolUnion[],
 ): Promise<number | null> {
+  const provider = getAPIProvider()
+
+  // OpenAI-compatible providers don't support this token counting approach.
+  // Returning null triggers a fallback to rough token estimation.
+  if (!['firstParty', 'bedrock', 'vertex', 'foundry'].includes(provider)) {
+    return null
+  }
+
   // Check if messages contain thinking blocks
   const containsThinking = hasThinkingBlocks(messages)
 
