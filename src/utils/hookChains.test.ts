@@ -1,13 +1,20 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import {
+  acquireSharedMutationLock,
+  releaseSharedMutationLock,
+} from '../test/sharedMutationLock.js'
+
+import * as policyLimits from '../services/policyLimits/index.js'
 
 type HookChainsModule = typeof import('./hookChains.js')
 
 const tempDirs: string[] = []
 const originalHookChainsEnabled = process.env.CLAUDE_CODE_ENABLE_HOOK_CHAINS
 
+/** Write a hook-chain fixture configuration in a temporary directory owned by the test. */
 async function makeConfigFile(config: unknown): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'openclaude-hook-chains-'))
   tempDirs.push(dir)
@@ -16,6 +23,7 @@ async function makeConfigFile(config: unknown): Promise<string> {
   return filePath
 }
 
+/** Load a fresh hook-chain module with deterministic policy and telemetry behavior. */
 async function importHookChainsModule(options?: {
   allowRemoteSessions?: boolean
 }): Promise<HookChainsModule> {
@@ -31,29 +39,32 @@ async function importHookChainsModule(options?: {
     logOTelEvent: async () => {},
   }))
 
-  mock.module('../services/policyLimits/index.js', () => ({
-    isPolicyAllowed: () => allowRemoteSessions,
-  }))
+  spyOn(policyLimits, 'isPolicyAllowed').mockImplementation(() => allowRemoteSessions)
 
   return import(`./hookChains.js?test=${Date.now()}-${Math.random()}`)
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  await acquireSharedMutationLock('utils/hookChains.test.ts')
   process.env.CLAUDE_CODE_ENABLE_HOOK_CHAINS = '1'
 })
 
 afterEach(async () => {
-  mock.restore()
+  try {
+    mock.restore()
 
-  if (originalHookChainsEnabled === undefined) {
-    delete process.env.CLAUDE_CODE_ENABLE_HOOK_CHAINS
-  } else {
-    process.env.CLAUDE_CODE_ENABLE_HOOK_CHAINS = originalHookChainsEnabled
+    if (originalHookChainsEnabled === undefined) {
+      delete process.env.CLAUDE_CODE_ENABLE_HOOK_CHAINS
+    } else {
+      process.env.CLAUDE_CODE_ENABLE_HOOK_CHAINS = originalHookChainsEnabled
+    }
+
+    await Promise.all(
+      tempDirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })),
+    )
+  } finally {
+    releaseSharedMutationLock()
   }
-
-  await Promise.all(
-    tempDirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })),
-  )
 })
 
 describe('hookChains schema validation', () => {

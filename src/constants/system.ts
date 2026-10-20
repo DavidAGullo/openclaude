@@ -2,17 +2,19 @@
 
 import { feature } from 'bun:bundle'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../services/analytics/growthbook.js'
+import type { AnthropicAttributionPolicy } from '../utils/anthropicAttribution.js'
 import { logForDebugging } from '../utils/debug.js'
 import { isEnvDefinedFalsy } from '../utils/envUtils.js'
 import { getAPIProvider } from '../utils/model/providers.js'
 import { getWorkload } from '../utils/workloadContext.js'
+import { PRODUCT_DISPLAY_NAME } from './product.js'
 
 const DEFAULT_PREFIX =
-  `You are OpenClaude, an open-source coding agent and CLI.`
+  `You are ${PRODUCT_DISPLAY_NAME}, an open-source coding agent and CLI.`
 const AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX =
-  `You are OpenClaude, an open-source coding agent and CLI running within the Claude Agent SDK.`
+  `You are ${PRODUCT_DISPLAY_NAME}, an open-source coding agent and CLI running within the Claude Agent SDK.`
 const AGENT_SDK_PREFIX =
-  `You are OpenClaude, built on the Claude Agent SDK.`
+  `You are ${PRODUCT_DISPLAY_NAME}, built on the Claude Agent SDK.`
 
 const CLI_SYSPROMPT_PREFIX_VALUES = [
   DEFAULT_PREFIX,
@@ -49,10 +51,10 @@ export function getCLISyspromptPrefix(options?: {
 }
 
 /**
- * Check if attribution header is enabled.
- * Enabled by default, can be disabled via env var or GrowthBook killswitch.
+ * Read the configured attribution preference. Provider and auth policy may
+ * override this when a route requires or forbids the billing block.
  */
-function isAttributionHeaderEnabled(): boolean {
+export function isAttributionHeaderEnabled(): boolean {
   if (isEnvDefinedFalsy(process.env.CLAUDE_CODE_ATTRIBUTION_HEADER)) {
     return false
   }
@@ -62,7 +64,8 @@ function isAttributionHeaderEnabled(): boolean {
 /**
  * Get attribution header for API requests.
  * Returns a header string with cc_version (including fingerprint) and cc_entrypoint.
- * Enabled by default, can be disabled via env var or GrowthBook killswitch.
+ * The caller must resolve provider and auth policy for the effective request
+ * route before calling this function.
  *
  * When NATIVE_CLIENT_ATTESTATION is enabled, includes a `cch=00000` placeholder.
  * Before the request is sent, Bun's native HTTP stack finds this placeholder
@@ -73,8 +76,11 @@ function isAttributionHeaderEnabled(): boolean {
  * We use a placeholder (instead of injecting from Zig) because same-length
  * replacement avoids Content-Length changes and buffer reallocation.
  */
-export function getAttributionHeader(fingerprint: string): string {
-  if (!isAttributionHeaderEnabled()) {
+export function getAttributionHeader(
+  fingerprint: string,
+  policy: AnthropicAttributionPolicy,
+): string {
+  if (!policy.generate) {
     return ''
   }
 
@@ -93,6 +99,6 @@ export function getAttributionHeader(fingerprint: string): string {
   const workloadPair = workload ? ` cc_workload=${workload};` : ''
   const header = `x-anthropic-billing-header: cc_version=${version}; cc_entrypoint=${entrypoint};${cch}${workloadPair}`
 
-  logForDebugging(`attribution header ${header}`)
+  logForDebugging(`attribution header generated: ${policy.reason}`)
   return header
 }

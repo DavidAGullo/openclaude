@@ -25,11 +25,16 @@ import {
   NO_RESPONSE_REQUESTED,
 } from 'src/utils/messages.js'
 import {
+  getDefaultMainLoopModel,
   getDefaultMainLoopModelSetting,
   isNonCustomOpusModel,
 } from 'src/utils/model/model.js'
 import { getModelStrings } from 'src/utils/model/modelStrings.js'
-import { getAPIProvider } from 'src/utils/model/providers.js'
+import {
+  getAPIProvider,
+  isFirstPartyAnthropicBaseUrl,
+  isFirstPartyAnthropicProvider,
+} from 'src/utils/model/providers.js'
 import { getIsNonInteractiveSession } from '../../bootstrap/state.js'
 import {
   API_PDF_MAX_PAGES,
@@ -38,6 +43,7 @@ import {
 import { isEnvTruthy } from '../../utils/envUtils.js'
 import { formatFileSize } from '../../utils/format.js'
 import { ImageResizeError } from '../../utils/imageResizer.js'
+import { RequestImageDimensionsError } from '../../utils/requestImageValidation.js'
 import { ImageSizeError } from '../../utils/imageValidation.js'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -51,7 +57,9 @@ import {
 import { shouldProcessRateLimits } from '../rateLimitMocking.js' // Used for /mock-limits command
 import { extractConnectionErrorDetails, formatAPIError } from './errorUtils.js'
 import {
+  extractOpenAICategoryHost,
   extractOpenAICategoryMarker,
+  isLocalhostLikeHost,
   type OpenAICompatibilityFailureCategory,
 } from './openaiErrorClassification.js'
 
@@ -68,26 +76,37 @@ function mapOpenAICompatibilityFailureToAssistantMessage(options: {
   category: OpenAICompatibilityFailureCategory
   model: string
   rawMessage: string
+  host?: string
 }): AssistantMessage {
   const switchCmd = getIsNonInteractiveSession() ? '--model' : '/model'
   const compactHint = getIsNonInteractiveSession()
     ? 'Reduce prompt size or start a new session.'
     : 'Run /compact or start a new session with /new.'
+  const isLocalhost = options.host === undefined || isLocalhostLikeHost(options.host)
 
   switch (options.category) {
     case 'localhost_resolution_failed':
     case 'connection_refused':
       return createAssistantAPIErrorMessage({
-        content:
-          'Could not connect to the local OpenAI-compatible provider. Ensure the local server is running, then use OPENAI_BASE_URL=http://127.0.0.1:11434/v1 for Ollama.',
+        content: isLocalhost
+          ? 'Could not connect to the local OpenAI-compatible provider. Ensure the local server is running, then use OPENAI_BASE_URL=http://127.0.0.1:11434/v1 for Ollama.'
+          : `Could not connect to the provider at ${options.host}. Verify OPENAI_BASE_URL is correct and that the host is reachable.`,
         error: 'unknown',
       })
 
     case 'endpoint_not_found':
       return createAssistantAPIErrorMessage({
-        content:
-          'Provider endpoint was not found. Confirm OPENAI_BASE_URL targets an OpenAI-compatible /v1 endpoint (for Ollama: http://127.0.0.1:11434/v1).',
+        content: isLocalhost
+          ? 'Provider endpoint was not found. Confirm OPENAI_BASE_URL targets an OpenAI-compatible /v1 endpoint (for Ollama: http://127.0.0.1:11434/v1).'
+          : `Provider endpoint at ${options.host} returned 404. Verify OPENAI_BASE_URL is correct and that the selected model (${options.model}) is supported by this provider.`,
         error: 'invalid_request',
+      })
+
+    case 'vision_not_supported':
+      return createAssistantAPIErrorMessage({
+        content: getVisionNotSupportedErrorMessage(),
+        error: 'invalid_request',
+        errorDetails: stripOpenAICompatibilityMetadata(options.rawMessage),
       })
 
     case 'model_not_found':
@@ -98,13 +117,19 @@ function mapOpenAICompatibilityFailureToAssistantMessage(options: {
 
     case 'auth_invalid':
       return createAssistantAPIErrorMessage({
-        content: `${API_ERROR_MESSAGE_PREFIX}: Authentication failed for your OpenAI-compatible provider. Verify OPENAI_API_KEY and endpoint-specific auth requirements.`,
+        content: `${API_ERROR_MESSAGE_PREFIX}: Authentication failed for your OpenAI-compatible provider. Verify OPENAI_API_KEYS or OPENAI_API_KEY and endpoint-specific auth requirements.`,
         error: 'authentication_failed',
       })
 
     case 'rate_limited':
       return createAssistantAPIErrorMessage({
         content: `${API_ERROR_MESSAGE_PREFIX}: Provider rate limit reached. Retry in a few seconds.`,
+        error: 'rate_limit',
+      })
+
+    case 'quota_exhausted':
+      return createAssistantAPIErrorMessage({
+        content: `${API_ERROR_MESSAGE_PREFIX}: Provider quota or usage allotment has run out. Please enable billing for your provider or switch provider via /provider.`,
         error: 'rate_limit',
       })
 
@@ -117,12 +142,26 @@ function mapOpenAICompatibilityFailureToAssistantMessage(options: {
     case 'context_overflow':
       return createAssistantAPIErrorMessage({
         content: `The conversation exceeded the provider context limit. ${compactHint}`,
+        apiError: 'context_overflow',
         error: 'invalid_request',
+        errorDetails: stripOpenAICompatibilityMetadata(options.rawMessage),
       })
 
     case 'tool_call_incompatible':
       return createAssistantAPIErrorMessage({
         content: `The selected provider/model rejected tool-calling payloads. Try ${switchCmd} to pick a tool-capable model or continue without tools.`,
+        error: 'invalid_request',
+      })
+
+    case 'tool_stream_unsupported':
+      return createAssistantAPIErrorMessage({
+        content: `The selected provider rejected the \`tool_stream\` parameter. Tool calls cannot be streamed on this provider. If this persists, switch models via ${switchCmd}.`,
+        error: 'invalid_request',
+      })
+
+    case 'stream_options_unsupported':
+      return createAssistantAPIErrorMessage({
+        content: 'The selected provider rejected the `stream_options` parameter and could not complete the compatibility fallback without usage reporting. Verify that the endpoint accepts ordinary streaming chat-completions requests.',
         error: 'invalid_request',
       })
 
@@ -218,6 +257,91 @@ export function getPromptTooLongTokenGap(
   return gap > 0 ? gap : undefined
 }
 
+const PROVIDER_MAX_TOKENS_CAP_NUMBER =
+  '([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)'
+
+const PROVIDER_MAX_TOKENS_CAP_PATTERNS = [
+  new RegExp(
+    `\\bmax_(?:completion_)?tokens\\b.{0,240}?\\bmaximum\\s+(?:output|completion)\\s+tokens?\\b[^0-9]{0,80}${PROVIDER_MAX_TOKENS_CAP_NUMBER}(?![0-9,]|\\.[0-9])`,
+    'is',
+  ),
+]
+
+function parseSafePositiveInteger(raw: string): number | undefined {
+  if (!/^(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)$/.test(raw)) {
+    return undefined
+  }
+
+  const normalized = raw.replace(/,/g, '')
+  if (!/^[0-9]+$/.test(normalized)) {
+    return undefined
+  }
+
+  const value = Number.parseInt(normalized, 10)
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    return undefined
+  }
+
+  return value
+}
+
+/**
+ * Parses provider-returned output token caps from runtime request errors.
+ * These are lower than static model metadata because gateways may account for
+ * prompt size or route-specific output limits at request time.
+ *
+ * OpenRouter-style 402 affordability errors are intentionally excluded here.
+ * Those are adjusted inside withRetry so that path has one recovery owner.
+ */
+export function parseProviderMaxTokensCap(
+  rawMessage: string,
+): number | undefined {
+  for (const pattern of PROVIDER_MAX_TOKENS_CAP_PATTERNS) {
+    const match = rawMessage.match(pattern)
+    const rawCap = match?.slice(1).find(Boolean)
+    if (!rawCap) {
+      continue
+    }
+
+    const cap = parseSafePositiveInteger(rawCap)
+    if (cap !== undefined) {
+      return cap
+    }
+  }
+
+  return undefined
+}
+
+export function getProviderMaxTokensCapFromMessage(
+  msg: AssistantMessage | undefined,
+): number | undefined {
+  if (
+    msg?.type !== 'assistant' ||
+    msg.apiError !== 'max_tokens_too_high'
+  ) {
+    return undefined
+  }
+
+  if (msg.errorDetails) {
+    return parseProviderMaxTokensCap(msg.errorDetails)
+  }
+
+  const content = msg.message?.content
+  if (!Array.isArray(content)) {
+    return undefined
+  }
+
+  const text = content
+    .filter(
+      (block): block is Extract<typeof block, { type: 'text' }> =>
+        block?.type === 'text' && typeof block.text === 'string',
+    )
+    .map(block => block.text)
+    .join('\n')
+
+  return parseProviderMaxTokensCap(text)
+}
+
 /**
  * Is this raw API error text a media-size rejection that stripImagesFromMessages
  * can fix? Reactive compact's summarize retry uses this to decide whether to
@@ -266,7 +390,7 @@ export const CCR_AUTH_ERROR_MESSAGE =
   'Authentication error · This may be a temporary network issue, please try again'
 export const REPEATED_529_ERROR_MESSAGE = 'Repeated 529 Overloaded errors'
 export function getCustomOffSwitchMessage(): string {
-  return getAPIProvider() === 'firstParty'
+  return isFirstPartyAnthropicProvider()
     ? 'Opus is experiencing high load, please use /model to switch to Sonnet'
     : 'The API is experiencing high load, please try again shortly or use /model to switch models'
 }
@@ -301,8 +425,130 @@ export function getRequestTooLargeErrorMessage(): string {
     ? `Request too large (${limits}). Try with a smaller file.`
     : `Request too large (${limits}). Double press esc to go back and try with a smaller file.`
 }
+
+const VISION_NOT_SUPPORTED_MESSAGE_PREFIX =
+  'The active model does not support image/vision inputs. The provider rejected the request because it contained an image. Remove the image, or'
+
+export function getVisionNotSupportedErrorMessages(): string[] {
+  return [
+    `${VISION_NOT_SUPPORTED_MESSAGE_PREFIX} switch to a vision-capable model with --model.`,
+    `${VISION_NOT_SUPPORTED_MESSAGE_PREFIX} run /model to switch to a vision-capable model.`,
+  ]
+}
+
+/**
+ * Canonical message for the `vision_not_supported` OpenAI compatibility
+ * failure (issue #1421). Returned as a stable string so that
+ * `normalizeMessagesForAPI`'s `errorToBlockTypes` map can self-heal existing
+ * transcripts by stripping `image` blocks from the preceding user message
+ * on resume.
+ */
+export function getVisionNotSupportedErrorMessage(): string {
+  const [nonInteractiveMessage, interactiveMessage] =
+    getVisionNotSupportedErrorMessages()
+  return getIsNonInteractiveSession()
+    ? nonInteractiveMessage!
+    : interactiveMessage!
+}
 export const OAUTH_ORG_NOT_ALLOWED_ERROR_MESSAGE =
-  'Your account does not have access to Claude Code. Please run /login.'
+  'Your account does not have access to OpenClaude. Please run /login.'
+
+// OpenCode Go subscription quota exhaustion. The opencode.ai gateway returns
+// 429 with one of these error types in the response body:
+//   - FreeUsageLimitError: free tier exhausted, upgrade required
+//   - GoUsageLimitError: paid Go subscription limit hit (rolling/weekly/monthly)
+// The `retry-after` header (seconds) indicates when the paid limit resets.
+// See https://github.com/anomalyco/opencode packages/opencode/src/session/retry.ts
+// for the canonical implementation we're mirroring.
+export const OPENCODE_GO_FREE_LIMIT_ERROR_MESSAGE =
+  'OpenCode Go free usage exhausted · Subscribe at https://opencode.ai/go'
+export const OPENCODE_GO_USAGE_LIMIT_ERROR_MESSAGE =
+  'OpenCode Go subscription limit reached · See https://opencode.ai/workspace/go'
+
+function getOpenCodeGoAssistantMessage(error: APIError): AssistantMessage | null {
+  const goLimit = parseOpenCodeGoLimitError(error)
+  if (!goLimit) return null
+
+  if (goLimit.kind === 'free') {
+    return createAssistantAPIErrorMessage({
+      content: OPENCODE_GO_FREE_LIMIT_ERROR_MESSAGE,
+      error: 'rate_limit',
+    })
+  }
+
+  const reset =
+    goLimit.retryAfterSeconds !== undefined
+      ? ` · Resets in ${formatResetDuration(goLimit.retryAfterSeconds)}`
+      : ''
+  const workspace =
+    goLimit.workspace && goLimit.workspace !== 'default'
+      ? ` · Workspace: ${goLimit.workspace}`
+      : ''
+  const limit = goLimit.limitName ? ` · Limit: ${goLimit.limitName}` : ''
+  return createAssistantAPIErrorMessage({
+    content: `${OPENCODE_GO_USAGE_LIMIT_ERROR_MESSAGE}${limit}${workspace}${reset}`,
+    error: 'rate_limit',
+  })
+}
+
+function parseOpenCodeGoLimitError(
+  error: APIError,
+): {
+  kind: 'free' | 'go'
+  limitName?: string
+  workspace?: string
+  retryAfterSeconds?: number
+} | null {
+  const requestUrl = error.headers?.get?.('x-opencode-request-url')
+  let isOpencodeGo = false
+  if (typeof requestUrl === 'string') {
+    isOpencodeGo = requestUrl.includes('opencode.ai/zen/go')
+  } else {
+    isOpencodeGo = (process.env.OPENAI_BASE_URL ?? '').includes('opencode.ai/zen/go')
+  }
+  if (!isOpencodeGo) return null
+
+  const body = error.message ?? ''
+  const retryAfter = error.headers?.get?.('retry-after')
+  const retryAfterSeconds = retryAfter ? Number(retryAfter) : undefined
+
+  if (body.includes('FreeUsageLimitError')) {
+    return { kind: 'free' }
+  }
+  if (body.includes('GoUsageLimitError')) {
+    const limitNameMatch = body.match(/"limitName"\s*:\s*"([^"]+)"/)
+    const workspaceMatch = body.match(/"workspace"\s*:\s*"([^"]+)"/)
+    return {
+      kind: 'go',
+      limitName: limitNameMatch?.[1],
+      workspace: workspaceMatch?.[1],
+      retryAfterSeconds:
+        typeof retryAfterSeconds === 'number' && !isNaN(retryAfterSeconds)
+          ? retryAfterSeconds
+          : undefined,
+    }
+  }
+  return null
+}
+
+// True when the error is an OpenCode Go subscription/free quota exhaustion
+// (429 with FreeUsageLimitError / GoUsageLimitError from the opencode.ai Go
+// gateway). Callers use this to keep the specific OpenCode Go assistant
+// message intact instead of clobbering it with the generic quota guard.
+export function isOpenCodeGoQuotaError(error: unknown): boolean {
+  return error instanceof APIError && parseOpenCodeGoLimitError(error) !== null
+}
+
+function formatResetDuration(seconds: number): string {
+  const days = Math.floor(seconds / 86400)
+  const hours = Math.floor((seconds % 86400) / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  const parts: string[] = []
+  if (days > 0) parts.push(`${days}d`)
+  if (hours > 0) parts.push(`${hours}h`)
+  if (minutes > 0 && days === 0) parts.push(`${minutes}m`)
+  return parts.join(' ') || 'soon'
+}
 
 export function getTokenRevokedErrorMessage(): string {
   return getIsNonInteractiveSession()
@@ -554,8 +800,31 @@ export function getAssistantMessageFromError(
   // but a generic message for SDK users (non-interactive mode)
   if (error instanceof ImageSizeError || error instanceof ImageResizeError) {
     return createAssistantAPIErrorMessage({
-      content: getImageTooLargeErrorMessage(),
+      content: error instanceof RequestImageDimensionsError
+        ? error.message
+        : getImageTooLargeErrorMessage(),
     })
+  }
+
+  if (error instanceof APIError) {
+    const providerMaxTokensCap = parseProviderMaxTokensCap(error.message)
+    if (providerMaxTokensCap !== undefined) {
+      return createAssistantAPIErrorMessage({
+        content: 'Provider max_tokens limit was lower than requested.',
+        apiError: 'max_tokens_too_high',
+        error: 'invalid_request',
+        errorDetails: error.message,
+      })
+    }
+  }
+
+  // OpenCode Go subscription quota exhaustion (429 with FreeUsageLimitError
+  // or GoUsageLimitError in the body). Check this before generic
+  // OpenAI-compatible markers so shim-shaped quota errors keep the
+  // provider-specific subscribe/reset guidance.
+  if (error instanceof APIError) {
+    const goMessage = getOpenCodeGoAssistantMessage(error)
+    if (goMessage) return goMessage
   }
 
   // OpenAI-compatible transport and HTTP failures include structured category
@@ -567,6 +836,7 @@ export function getAssistantMessageFromError(
         category: openaiCategory,
         model,
         rawMessage: error.message,
+        host: extractOpenAICategoryHost(error.message),
       })
     }
   }
@@ -679,6 +949,18 @@ export function getAssistantMessageFromError(
       content: `${API_ERROR_MESSAGE_PREFIX}: Request rejected (429) · ${detail || 'this may be a temporary capacity issue'} — ${retryHint}`,
       error: 'rate_limit',
     })
+  }
+
+  if (!(error instanceof APIError) && error instanceof Error) {
+    const providerMaxTokensCap = parseProviderMaxTokensCap(error.message)
+    if (providerMaxTokensCap !== undefined) {
+      return createAssistantAPIErrorMessage({
+        content: 'Provider max_tokens limit was lower than requested.',
+        apiError: 'max_tokens_too_high',
+        error: 'invalid_request',
+        errorDetails: error.message,
+      })
+    }
   }
 
   // Handle prompt too long errors (Vertex returns 413, direct API returns 400)
@@ -937,7 +1219,7 @@ export function getAssistantMessageFromError(
   if (
     error instanceof Error &&
     error.message.toLowerCase().includes('x-api-key') &&
-    getAPIProvider() === 'firstParty'
+    isFirstPartyAnthropicProvider()
   ) {
     // In CCR mode, auth is via JWTs - this is likely a transient network issue
     if (isCCRMode()) {
@@ -1002,8 +1284,10 @@ export function getAssistantMessageFromError(
     return createAssistantAPIErrorMessage({
       error: 'authentication_failed',
       content: getIsNonInteractiveSession()
-        ? `Failed to authenticate. ${API_ERROR_MESSAGE_PREFIX}: ${error.message}`
-        : `Please run /login · ${API_ERROR_MESSAGE_PREFIX}: ${error.message}`,
+        ? `Failed to authenticate. ${API_ERROR_MESSAGE_PREFIX}: Authentication failed (status ${error.status}). Check your API key configuration.`
+        : isFirstPartyAnthropicProvider()
+          ? `Please run /login · ${API_ERROR_MESSAGE_PREFIX}: Authentication failed (status ${error.status}). Check your API key configuration.`
+          : `${API_ERROR_MESSAGE_PREFIX}: Authentication failed (status ${error.status}). Check your provider credential configuration.`,
     })
   }
 
@@ -1057,6 +1341,7 @@ export function getAssistantMessageFromError(
       : ' Press esc twice to go up a few messages, or run /compact to reduce context.'
     return createAssistantAPIErrorMessage({
       content: `The conversation has grown too large for the API to process.${rewindInstruction} Alternatively, start a new session with /new.`,
+      apiError: 'context_overflow',
       error: 'invalid_request',
       errorDetails: `Context overflow (500): ${error.message}`,
     })
@@ -1087,11 +1372,19 @@ export function getAssistantMessageFromError(
  * Returns a model name suggestion, or undefined if no suggestion is applicable.
  */
 function get3PModelFallbackSuggestion(model: string): string | undefined {
-  if (getAPIProvider() === 'firstParty') {
+  if (isFirstPartyAnthropicProvider()) {
     return undefined
   }
   // @[MODEL LAUNCH]: Add a fallback suggestion chain for the new model → previous version for 3P
   const m = model.toLowerCase()
+  // Mirror the validation-time fallback chain in validateModel.ts so the error
+  // path suggests the previous Opus for the recent models too.
+  if (m.includes('opus-4-8') || m.includes('opus_4_8')) {
+    return getModelStrings().opus47
+  }
+  if (m.includes('opus-4-7') || m.includes('opus_4_7')) {
+    return getModelStrings().opus46
+  }
   // If the failing model looks like an Opus 4.6 variant, suggest the default Opus (4.1 for 3P)
   if (m.includes('opus-4-6') || m.includes('opus_4_6')) {
     return getModelStrings().opus41
@@ -1140,6 +1433,11 @@ export function classifyAPIError(error: unknown): string {
     error.message.includes(CUSTOM_OFF_SWITCH_MESSAGE)
   ) {
     return 'capacity_off_switch'
+  }
+
+  // OpenCode Go subscription quota exhaustion (distinct from generic 429)
+  if (error instanceof APIError && parseOpenCodeGoLimitError(error)) {
+    return 'opencode_go_quota_exhausted'
   }
 
   // Rate limiting
@@ -1341,17 +1639,18 @@ export function getErrorMessageIfRefusal(
   logEvent('tengu_refusal_api_response', {})
 
   const usagePolicyUrl =
-    getAPIProvider() === 'firstParty'
+    isFirstPartyAnthropicProvider()
       ? 'https://www.anthropic.com/legal/aup'
       : "your provider's acceptable use policy"
 
   const baseMessage = getIsNonInteractiveSession()
-    ? `${API_ERROR_MESSAGE_PREFIX}: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (${usagePolicyUrl}). Try rephrasing the request or attempting a different approach.`
-    : `${API_ERROR_MESSAGE_PREFIX}: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (${usagePolicyUrl}). Please double press esc to edit your last message or start a new session for Claude Code to assist with a different task.`
+    ? `${API_ERROR_MESSAGE_PREFIX}: OpenClaude is unable to respond to this request, which appears to violate our Usage Policy (${usagePolicyUrl}). Try rephrasing the request or attempting a different approach.`
+    : `${API_ERROR_MESSAGE_PREFIX}: OpenClaude is unable to respond to this request, which appears to violate our Usage Policy (${usagePolicyUrl}). Please double press esc to edit your last message or start a new session for OpenClaude to assist with a different task.`
 
+  const defaultModel = getDefaultMainLoopModel()
   const modelSuggestion =
-    model !== 'claude-sonnet-4-20250514'
-      ? ' If you are seeing this refusal repeatedly, try running /model claude-sonnet-4-20250514 to switch models.'
+    model !== defaultModel
+      ? ` If you are seeing this refusal repeatedly, try running /model ${defaultModel} to switch models.`
       : ''
 
   return createAssistantAPIErrorMessage({

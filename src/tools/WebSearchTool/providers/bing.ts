@@ -6,6 +6,7 @@
 
 import type { SearchInput, SearchProvider } from './types.js'
 import { applyDomainFilters, type ProviderOutput } from './types.js'
+import { fetchJsonWithWebSearchTimeout } from './timeout.js'
 
 export const bingProvider: SearchProvider = {
   name: 'bing',
@@ -21,22 +22,26 @@ export const bingProvider: SearchProvider = {
     url.searchParams.set('q', input.query)
     url.searchParams.set('count', '15')
 
-    const res = await fetch(url.toString(), {
-      headers: { 'Ocp-Apim-Subscription-Key': process.env.BING_API_KEY! },
+    const data = (await fetchJsonWithWebSearchTimeout(
+      url.toString(),
+      {
+        headers: { 'Ocp-Apim-Subscription-Key': process.env.BING_API_KEY! },
+      },
       signal,
+      { providerName: 'Bing' },
+    )) as { webPages?: { value?: unknown } } | undefined
+
+    const rawResults = data?.webPages?.value
+    const results = Array.isArray(rawResults) ? rawResults : []
+    const hits = (results as unknown[]).map((r) => {
+      const rec = (r ?? {}) as Record<string, unknown>
+      return {
+        title: typeof rec.name === 'string' ? rec.name : '',
+        url: typeof rec.url === 'string' ? rec.url : '',
+        description: typeof rec.snippet === 'string' ? rec.snippet : undefined,
+        source: typeof rec.displayUrl === 'string' ? rec.displayUrl : undefined,
+      }
     })
-
-    if (!res.ok) {
-      throw new Error(`Bing search error ${res.status}: ${await res.text().catch(() => '')}`)
-    }
-
-    const data = await res.json()
-    const hits = (data.webPages?.value ?? []).map((r: any) => ({
-      title: r.name ?? '',
-      url: r.url ?? '',
-      description: r.snippet,
-      source: r.displayUrl,
-    }))
 
     return {
       hits: applyDomainFilters(hits, input),

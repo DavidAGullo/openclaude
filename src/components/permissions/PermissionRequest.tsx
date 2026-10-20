@@ -1,6 +1,7 @@
 import { c as _c } from "react-compiler-runtime";
 import { feature } from 'bun:bundle';
 import * as React from 'react';
+import { PRODUCT_DISPLAY_NAME } from 'src/constants/product.js';
 import { EnterPlanModeTool } from 'src/tools/EnterPlanModeTool/EnterPlanModeTool.js';
 import { ExitPlanModeV2Tool } from 'src/tools/ExitPlanModeTool/ExitPlanModeV2Tool.js';
 import { useNotifyAfterTimeout } from '../../hooks/useNotifyAfterTimeout.js';
@@ -18,6 +19,7 @@ import { PowerShellTool } from '../../tools/PowerShellTool/PowerShellTool.js';
 import { SkillTool } from '../../tools/SkillTool/SkillTool.js';
 import { WebFetchTool } from '../../tools/WebFetchTool/WebFetchTool.js';
 import type { AssistantMessage } from '../../types/message.js';
+import type { SessionId } from '../../types/ids.js';
 import type { PermissionDecision } from '../../utils/permissions/PermissionResult.js';
 import { AskUserQuestionPermissionRequest } from './AskUserQuestionPermissionRequest/AskUserQuestionPermissionRequest.js';
 import { BashPermissionRequest } from './BashPermissionRequest/BashPermissionRequest.js';
@@ -107,6 +109,8 @@ export type ToolUseConfirm<Input extends AnyObject = AnyObject> = {
   input: z.infer<Input>;
   toolUseContext: ToolUseContext;
   toolUseID: string;
+  /** Originating session for forwarded agent prompts. */
+  permissionSessionId?: SessionId;
   permissionResult: PermissionDecision;
   permissionPromptStartTimeMs: number;
   /**
@@ -119,7 +123,7 @@ export type ToolUseConfirm<Input extends AnyObject = AnyObject> = {
   classifierMatchedRule?: string;
   workerBadge?: WorkerBadgeProps;
   onUserInteraction(): void;
-  onAbort(): void;
+  onAbort(source?: string, causalEventId?: string): void;
   onDismissCheckmark?(): void;
   onAllow(updatedInput: z.infer<Input>, permissionUpdates: PermissionUpdate[], feedback?: string, contentBlocks?: ContentBlockParam[]): void;
   onReject(feedback?: string, contentBlocks?: ContentBlockParam[]): void;
@@ -128,18 +132,18 @@ export type ToolUseConfirm<Input extends AnyObject = AnyObject> = {
 function getNotificationMessage(toolUseConfirm: ToolUseConfirm): string {
   const toolName = toolUseConfirm.tool.userFacingName(toolUseConfirm.input as never);
   if (toolUseConfirm.tool === ExitPlanModeV2Tool) {
-    return 'Claude Code needs your approval for the plan';
+    return `${PRODUCT_DISPLAY_NAME} needs your approval for the plan`;
   }
   if (toolUseConfirm.tool === EnterPlanModeTool) {
-    return 'Claude Code wants to enter plan mode';
+    return `${PRODUCT_DISPLAY_NAME} wants to enter plan mode`;
   }
   if (feature('REVIEW_ARTIFACT') && toolUseConfirm.tool === ReviewArtifactTool) {
-    return 'Claude needs your approval for a review artifact';
+    return `${PRODUCT_DISPLAY_NAME} needs your approval for a review artifact`;
   }
   if (!toolName || toolName.trim() === '') {
-    return 'Claude Code needs your attention';
+    return `${PRODUCT_DISPLAY_NAME} needs your attention`;
   }
-  return `Claude needs your permission to use ${toolName}`;
+  return `${PRODUCT_DISPLAY_NAME} needs your permission to use ${toolName}`;
 }
 
 // TODO: Move this to Tool.renderPermissionRequest

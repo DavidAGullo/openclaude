@@ -2,13 +2,6 @@ import { feature } from 'bun:bundle'
 import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs'
 import type { QuerySource } from '../../constants/querySource.js'
 import type { ToolUseContext } from '../../Tool.js'
-import { FILE_EDIT_TOOL_NAME } from '../../tools/FileEditTool/constants.js'
-import { FILE_READ_TOOL_NAME } from '../../tools/FileReadTool/prompt.js'
-import { FILE_WRITE_TOOL_NAME } from '../../tools/FileWriteTool/prompt.js'
-import { GLOB_TOOL_NAME } from '../../tools/GlobTool/prompt.js'
-import { GREP_TOOL_NAME } from '../../tools/GrepTool/prompt.js'
-import { WEB_FETCH_TOOL_NAME } from '../../tools/WebFetchTool/prompt.js'
-import { WEB_SEARCH_TOOL_NAME } from '../../tools/WebSearchTool/prompt.js'
 import type { Message } from '../../types/message.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { getMainLoopModel } from '../../utils/model/model.js'
@@ -39,14 +32,14 @@ const IMAGE_MAX_TOKEN_SIZE = 2000
 
 // Only compact these built-in tools (MCP tools are also compactable via prefix match)
 export const COMPACTABLE_TOOLS = new Set<string>([
-  FILE_READ_TOOL_NAME,
+  'Read',
   ...SHELL_TOOL_NAMES,
-  GREP_TOOL_NAME,
-  GLOB_TOOL_NAME,
-  WEB_SEARCH_TOOL_NAME,
-  WEB_FETCH_TOOL_NAME,
-  FILE_EDIT_TOOL_NAME,
-  FILE_WRITE_TOOL_NAME,
+  'Grep',
+  'Glob',
+  'WebSearch',
+  'WebFetch',
+  'Edit',
+  'Write',
 ])
 
 const MCP_TOOL_PREFIX = 'mcp__'
@@ -172,6 +165,11 @@ export function estimateMessageTokens(messages: Message[]): number {
 
   for (const message of messages) {
     if (message.type !== 'user' && message.type !== 'assistant') {
+      continue
+    }
+
+    if (typeof message.message?.content === 'string') {
+      totalTokens += roughTokenCountEstimation(message.message.content)
       continue
     }
 
@@ -316,6 +314,16 @@ async function cachedMicrocompactPath(
   const state = ensureCachedMCState()
   const config = mod.getCachedMCConfig()
 
+  if (!config) {
+    // Invariant: if isCachedMicrocompactEnabled() is true, getCachedMCConfig()
+    // must not be null. This guard prevents a theoretical recursion loop in
+    // future non-stub implementations where the cached path could re-enter
+    // itself via the fallback to microcompactMessages.
+    throw new Error(
+      'cachedMicrocompact invariant violation: isCachedMicrocompactEnabled() is true but getCachedMCConfig() returned null',
+    )
+  }
+
   const compactableToolIds = new Set(collectCompactableToolIds(messages))
   // Second pass: register tool results grouped by user message
   for (const message of messages) {
@@ -428,8 +436,8 @@ async function cachedMicrocompactPath(
 export function evaluateTimeBasedTrigger(
   messages: Message[],
   querySource: QuerySource | undefined,
+  config: TimeBasedMCConfig = getTimeBasedMCConfig(),
 ): { gapMinutes: number; config: TimeBasedMCConfig } | null {
-  const config = getTimeBasedMCConfig()
   // Require an explicit main-thread querySource. isMainThreadSource treats
   // undefined as main-thread (for cached-MC backward-compat), but several
   // callers (/context, /compact, analyzeContext) invoke microcompactMessages
@@ -449,11 +457,16 @@ export function evaluateTimeBasedTrigger(
   return { gapMinutes, config }
 }
 
-function maybeTimeBasedMicrocompact(
+export function maybeTimeBasedMicrocompact(
   messages: Message[],
   querySource: QuerySource | undefined,
+  configOverride?: TimeBasedMCConfig,
 ): MicrocompactResult | null {
-  const trigger = evaluateTimeBasedTrigger(messages, querySource)
+  const trigger = evaluateTimeBasedTrigger(
+    messages,
+    querySource,
+    configOverride,
+  )
   if (!trigger) {
     return null
   }
@@ -494,6 +507,9 @@ function maybeTimeBasedMicrocompact(
     return {
       ...message,
       message: { ...message.message, content: newContent },
+      // The prompt content no longer contains the original tool result, so
+      // keeping the duplicate native payload only grows long-session memory.
+      toolUseResult: undefined,
     }
   })
 

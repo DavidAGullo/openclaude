@@ -1,6 +1,6 @@
 import memoize from 'lodash-es/memoize.js'
 import { homedir } from 'os'
-import { dirname, isAbsolute, resolve } from 'path'
+import { dirname, isAbsolute, join, resolve } from 'path'
 import type { ToolPermissionContext } from '../../Tool.js'
 import { getPlatform } from '../../utils/platform.js'
 import {
@@ -76,14 +76,25 @@ export function getGlobBaseDirectory(path: string): string {
 /**
  * Expands tilde (~) at the start of a path to the user's home directory.
  * Note: ~username expansion is not supported for security reasons.
+ *
+ * Uses path.join rather than string concatenation. Concatenating
+ * `homedir() + path.slice(1)` keeps the leading `/` from `~/...`, which
+ * happens to work on POSIX (`/home/user` + `/.openclaude`) but on Windows
+ * produces mixed separators (`C:\Users\Name/.openclaude`) and, for any
+ * helper that strips `~/` including the slash, glues the names together
+ * (`C:\Users\Name.openclaude`). Plugin cache overrides such as
+ * CLAUDE_CODE_PLUGIN_CACHE_DIR=`~/.openclaude/plugins` go through this
+ * helper (issue #2183).
  */
 export function expandTilde(path: string): string {
+  if (path === '~') {
+    return homedir()
+  }
   if (
-    path === '~' ||
     path.startsWith('~/') ||
     (process.platform === 'win32' && path.startsWith('~\\'))
   ) {
-    return homedir() + path.slice(1)
+    return join(homedir(), path.slice(2))
   }
   return path
 }
@@ -112,8 +123,8 @@ export function isPathInSandboxWriteAllowlist(resolvedPath: string): boolean {
   // their resolution to avoid N × config.length redundant syscalls per
   // command with N write targets (matching getResolvedWorkingDirPaths).
   const pathsToCheck = getPathsForPermissionCheck(resolvedPath)
-  const resolvedAllow = allowOnly.flatMap(getResolvedSandboxConfigPath)
-  const resolvedDeny = denyWithinAllow.flatMap(getResolvedSandboxConfigPath)
+  const resolvedAllow = allowOnly.flatMap(path => getResolvedSandboxConfigPath(path))
+  const resolvedDeny = denyWithinAllow.flatMap(path => getResolvedSandboxConfigPath(path))
   return pathsToCheck.every(p => {
     for (const denyPath of resolvedDeny) {
       if (pathInWorkingPath(p, denyPath)) return false
@@ -166,7 +177,7 @@ export function isPathAllowed(
   // and internal editable paths live under ~/.claude/ — matching the ordering in
   // checkWritePermissionForTool (filesystem.ts step 1.5)
   if (operationType !== 'read') {
-    const internalEditResult = checkEditableInternalPath(resolvedPath, {})
+    const internalEditResult = checkEditableInternalPath(resolvedPath, {}, context)
     if (internalEditResult.behavior === 'allow') {
       return {
         allowed: true,

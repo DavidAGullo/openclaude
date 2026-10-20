@@ -18,6 +18,7 @@ import {
 } from '../../utils/http.js'
 import { logError } from '../../utils/log.js'
 import { getClaudeCodeUserAgent } from '../../utils/userAgent.js'
+import { isFirstPartyAnthropicProvider } from '../../utils/model/providers.js'
 
 // Cache expiration: 24 hours
 const GROVE_CACHE_EXPIRATION_MS = 24 * 60 * 60 * 1000
@@ -41,6 +42,13 @@ export type GroveConfig = {
  */
 export type ApiResult<T> = { success: true; data: T } | { success: false }
 
+function getGroveCacheKey(): string {
+  // Provider selection can change during a process lifetime. Keep first-party
+  // responses separate from the custom-provider no-op result so switching
+  // endpoints cannot surface stale account settings or disable Grove later.
+  return `${isFirstPartyAnthropicProvider()}:${process.env.ANTHROPIC_BASE_URL ?? ''}`
+}
+
 /**
  * Get the current Grove settings for the user account.
  * Returns ApiResult to distinguish between API failure and success.
@@ -51,6 +59,9 @@ export type ApiResult<T> = { success: true; data: T } | { success: false }
  */
 export const getGroveSettings = memoize(
   async (): Promise<ApiResult<AccountSettings>> => {
+    if (!isFirstPartyAnthropicProvider()) {
+      return { success: false }
+    }
     // Grove is a notification feature; during an outage, skipping it is correct.
     if (isEssentialTrafficOnly()) {
       return { success: false }
@@ -82,12 +93,14 @@ export const getGroveSettings = memoize(
       return { success: false }
     }
   },
+  getGroveCacheKey,
 )
 
 /**
  * Mark that the Grove notice has been viewed by the user
  */
 export async function markGroveNoticeViewed(): Promise<void> {
+  if (!isFirstPartyAnthropicProvider()) return
   try {
     await withOAuth401Retry(() => {
       const authHeaders = getAuthHeaders()
@@ -120,6 +133,7 @@ export async function markGroveNoticeViewed(): Promise<void> {
 export async function updateGroveSettings(
   groveEnabled: boolean,
 ): Promise<void> {
+  if (!isFirstPartyAnthropicProvider()) return
   try {
     await withOAuth401Retry(() => {
       const authHeaders = getAuthHeaders()
@@ -155,6 +169,9 @@ export async function updateGroveSettings(
  * false and the Grove dialog won't show until the next session.
  */
 export async function isQualifiedForGrove(): Promise<boolean> {
+  if (!isFirstPartyAnthropicProvider()) {
+    return false
+  }
   if (!isConsumerSubscriber()) {
     return false
   }
@@ -204,7 +221,8 @@ async function fetchAndStoreGroveConfig(accountId: string): Promise<void> {
     const groveEnabled = result.data.grove_enabled
     const cachedEntry = getGlobalConfig().groveConfigCache?.[accountId]
     if (
-      cachedEntry?.grove_enabled === groveEnabled &&
+      cachedEntry !== undefined &&
+      cachedEntry.grove_enabled === groveEnabled &&
       Date.now() - cachedEntry.timestamp <= GROVE_CACHE_EXPIRATION_MS
     ) {
       return
@@ -231,6 +249,9 @@ async function fetchAndStoreGroveConfig(accountId: string): Promise<void> {
  */
 export const getGroveNoticeConfig = memoize(
   async (): Promise<ApiResult<GroveConfig>> => {
+    if (!isFirstPartyAnthropicProvider()) {
+      return { success: false }
+    }
     // Grove is a notification feature; during an outage, skipping it is correct.
     if (isEssentialTrafficOnly()) {
       return { success: false }
@@ -275,6 +296,7 @@ export const getGroveNoticeConfig = memoize(
       return { success: false }
     }
   },
+  getGroveCacheKey,
 )
 
 /**
@@ -343,13 +365,13 @@ export async function checkGroveForNonInteractive(): Promise<void> {
     if (config === null || config.notice_is_grace_period) {
       // Grace period is still active - show informational message and continue
       writeToStderr(
-        '\nAn update to our Consumer Terms and Privacy Policy will take effect on October 8, 2025. Run `claude` to review the updated terms.\n\n',
+        '\nAn update to our Consumer Terms and Privacy Policy will take effect on October 8, 2025. Run `openclaude` to review the updated terms.\n\n',
       )
       await markGroveNoticeViewed()
     } else {
       // Grace period has ended - show error message and exit
       writeToStderr(
-        '\n[ACTION REQUIRED] An update to our Consumer Terms and Privacy Policy has taken effect on October 8, 2025. You must run `claude` to review the updated terms.\n\n',
+        '\n[ACTION REQUIRED] An update to our Consumer Terms and Privacy Policy has taken effect on October 8, 2025. You must run `openclaude` to review the updated terms.\n\n',
       )
       await gracefulShutdown(1)
     }

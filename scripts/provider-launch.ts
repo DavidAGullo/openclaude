@@ -10,10 +10,15 @@ import {
 import {
   buildLaunchEnv,
   loadProfileFile,
+  resolveOpenAICredentialEnvState,
   selectAutoProfile,
   type ProfileFile,
   type ProviderProfile,
 } from '../src/utils/providerProfile.ts'
+import {
+  getRouteCredentialValue,
+  resolveActiveRouteIdFromEnv,
+} from '../src/integrations/routeMetadata.ts'
 import {
   getAtomicChatChatBaseUrl,
   getOllamaChatBaseUrl,
@@ -137,6 +142,42 @@ function printSummary(profile: ProviderProfile): void {
   }
 }
 
+function hasUsableGeminiLaunchAuth(env: NodeJS.ProcessEnv): boolean {
+  const authMode = env.GEMINI_AUTH_MODE?.trim().toLowerCase()
+  if (authMode === 'adc') {
+    return true
+  }
+  if (authMode === 'access-token') {
+    return Boolean(env.GEMINI_ACCESS_TOKEN?.trim())
+  }
+  return Boolean(
+    env.GEMINI_API_KEY?.trim() ||
+      env.GOOGLE_API_KEY?.trim() ||
+      env.GEMINI_ACCESS_TOKEN?.trim(),
+  )
+}
+
+export function hasUsableOpenAILaunchCredential(
+  env: NodeJS.ProcessEnv,
+): boolean {
+  return getOpenAILaunchCredentialError(env) === null
+}
+
+export function getOpenAILaunchCredentialError(
+  env: NodeJS.ProcessEnv,
+): string | null {
+  if (resolveActiveRouteIdFromEnv(env) === 'commandcode') {
+    if (getRouteCredentialValue('commandcode', env)) {
+      return null
+    }
+    return 'CMD_API_KEY is required for the Command Code route (fallbacks: COMMANDCODE_API_KEY or COMMAND_CODE_API_KEY) and cannot include placeholder values such as SUA_CHAVE. Set one of those environment variables, rerun the launcher, then use /provider to save the Command Code profile.'
+  }
+  if (resolveOpenAICredentialEnvState(env).configured) {
+    return null
+  }
+  return 'OPENAI_API_KEYS or OPENAI_API_KEY is required for openai profile and cannot include SUA_CHAVE. Run: bun run profile:init -- --provider openai --api-key <key>'
+}
+
 async function main(): Promise<void> {
   const options = parseLaunchOptions(process.argv.slice(2))
   const requestedProfile = options.requestedProfile
@@ -202,8 +243,8 @@ async function main(): Promise<void> {
     applyFastFlags(env)
   }
 
-  if (profile === 'gemini' && !env.GEMINI_API_KEY) {
-    console.error('GEMINI_API_KEY is required for gemini profile. Run: bun run profile:init -- --provider gemini --api-key <key>')
+  if (profile === 'gemini' && !hasUsableGeminiLaunchAuth(env)) {
+    console.error('Gemini credentials are required for gemini profile. Use `bun run profile:init -- --provider gemini --api-key <key>`, save an access-token/ADC Gemini profile with `/provider`, or set GEMINI_API_KEY/GOOGLE_API_KEY/GEMINI_ACCESS_TOKEN.')
     process.exit(1)
   }
 
@@ -212,8 +253,10 @@ async function main(): Promise<void> {
     process.exit(1)
   }
 
-  if (profile === 'openai' && (!env.OPENAI_API_KEY || env.OPENAI_API_KEY === 'SUA_CHAVE')) {
-    console.error('OPENAI_API_KEY is required for openai profile and cannot be SUA_CHAVE. Run: bun run profile:init -- --provider openai --api-key <key>')
+  const openAICredentialError =
+    profile === 'openai' ? getOpenAILaunchCredentialError(env) : null
+  if (openAICredentialError) {
+    console.error(openAICredentialError)
     process.exit(1)
   }
 
@@ -246,10 +289,12 @@ async function main(): Promise<void> {
     process.exit(buildCode)
   }
 
-  const devCode = await runProcess('node', ['dist/cli.mjs', ...options.passthroughArgs], env)
+  const devCode = await runProcess('node', ['bin/openclaude', ...options.passthroughArgs], env)
   process.exit(devCode)
 }
 
-await main()
+if (import.meta.main) {
+  await main()
+}
 
 export {}

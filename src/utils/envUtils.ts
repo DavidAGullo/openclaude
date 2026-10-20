@@ -1,13 +1,35 @@
 import memoize from 'lodash-es/memoize.js'
-import { existsSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
+
+/**
+ * Resolves the override env value for the config home directory.
+ * Resolves the OpenClaude config home override.
+ *
+ * Intentionally does not read `CLAUDE_CONFIG_DIR`: OpenClaude config must stay
+ * independent from Claude Code config and credentials.
+ */
+export function resolveConfigDirEnv(options?: {
+  openClaudeConfigDir?: string
+  legacyConfigDir?: string
+  warn?: (message: string) => void
+}): string | undefined {
+  void options?.legacyConfigDir
+  void options?.warn
+  return options?.openClaudeConfigDir || undefined
+}
+
+/**
+ * Test-only escape hatch — resets the once-per-process conflict warning so
+ * unit tests can re-trigger it.
+ */
+export function __resetConfigDirEnvWarningForTesting(): void {
+  // Kept as a no-op for older tests importing this helper.
+}
 
 export function resolveClaudeConfigHomeDir(options?: {
   configDirEnv?: string
   homeDir?: string
-  openClaudeExists?: boolean
-  legacyClaudeExists?: boolean
 }): string {
   if (options?.configDirEnv) {
     return options.configDirEnv.normalize('NFC')
@@ -15,32 +37,59 @@ export function resolveClaudeConfigHomeDir(options?: {
 
   const homeDir = options?.homeDir ?? homedir()
   const openClaudeDir = join(homeDir, '.openclaude')
-  const legacyClaudeDir = join(homeDir, '.claude')
-  const openClaudeExists =
-    options?.openClaudeExists ?? existsSync(openClaudeDir)
-  const legacyClaudeExists =
-    options?.legacyClaudeExists ?? existsSync(legacyClaudeDir)
-
-  // Preserve existing user config/install state until we ship an explicit
-  // migration. New installs (neither path exists) use ~/.openclaude.
-  if (!openClaudeExists && legacyClaudeExists) {
-    return legacyClaudeDir.normalize('NFC')
-  }
 
   return openClaudeDir.normalize('NFC')
 }
 
-// Memoized: 150+ callers, many on hot paths. Keyed off CLAUDE_CONFIG_DIR so
-// tests that change the env var get a fresh value without explicit cache.clear.
-export const getClaudeConfigHomeDir = memoize(
-  (): string => resolveClaudeConfigHomeDir({
-    configDirEnv: process.env.CLAUDE_CONFIG_DIR,
-  }),
-  () => process.env.CLAUDE_CONFIG_DIR,
+let claudeConfigHomeDirOverride: string | undefined
+
+export function setClaudeConfigHomeDirForTesting(
+  configDir: string | undefined,
+): void {
+  claudeConfigHomeDirOverride = configDir?.normalize('NFC')
+}
+
+export function getClaudeConfigHomeDirOverrideForTesting(): string | undefined {
+  return claudeConfigHomeDirOverride
+}
+
+// Memoized for the default home-dir path: 150+ callers, many on hot paths.
+// Explicit env overrides and test overrides bypass this cache so runtime
+// overrides cannot be masked by a previously memoized default path.
+const getDefaultClaudeConfigHomeDir = memoize(
+  (): string => {
+    const homeDir = homedir()
+    return resolveClaudeConfigHomeDir({
+      homeDir,
+    })
+  },
+  () => homedir(),
+)
+
+export const getClaudeConfigHomeDir = Object.assign(
+  (): string => {
+    if (claudeConfigHomeDirOverride) {
+      return claudeConfigHomeDirOverride
+    }
+
+    const configDirEnv = resolveConfigDirEnv({
+      openClaudeConfigDir: process.env.OPENCLAUDE_CONFIG_DIR,
+    })
+    if (configDirEnv) {
+      return resolveClaudeConfigHomeDir({ configDirEnv })
+    }
+
+    return getDefaultClaudeConfigHomeDir()
+  },
+  { cache: getDefaultClaudeConfigHomeDir.cache },
 )
 
 export function getTeamsDir(): string {
   return join(getClaudeConfigHomeDir(), 'teams')
+}
+
+export function getProjectsDir(): string {
+  return join(getClaudeConfigHomeDir(), 'projects')
 }
 
 /**

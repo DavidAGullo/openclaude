@@ -12,8 +12,12 @@ import {
 import {
   convertEffortValueToLevel,
   type EffortValue,
+  resolveAppliedEffort,
+  resolveModelReasoningControl,
+  modelSupportsShimReasoningEffort,
+  modelSupportsWireEffort,
   standardEffortToOpenAI,
-  type OpenAIEffortLevel,
+  type OpenAIShimEffortLevel,
 } from 'src/utils/effort.js'
 import { getUserAgent } from 'src/utils/http.js'
 import { getSmallFastModel } from 'src/utils/model/model.js'
@@ -34,11 +38,43 @@ import {
   getVertexRegionForModel,
   isEnvTruthy,
 } from '../../utils/envUtils.js'
+import {
+  getFireworksBaseUrlOverride,
+  getLongcatBaseUrlOverride,
+  getMiniMaxBaseUrlOverride,
+  getMiniMaxBaseUrlValidationError,
+  isMiniMaxBaseUrl,
+  getNearaiBaseUrlOverride,
+  isCanonicalApiRouteInferenceBaseUrl,
+  isCanonicalApismartInferenceBaseUrl,
+  isCanonicalConcentrateInferenceBaseUrl,
+  getRouteDefaultBaseUrl,
+  getRouteDefaultModel,
+  getXaiBaseUrlOverride,
+  getXiaomiMimoBaseUrlOverride,
+  resolveEnvOnlyProviderRouteId,
+} from '../../integrations/routeMetadata.js'
+import { resolveOpenAIShimRuntimeContext } from '../../integrations/runtimeMetadata.js'
+import {
+  shouldUseCustomAnthropicBearerAuth,
+  shouldUseFirstPartyAnthropicAuthForProvider,
+  type ProviderOverride,
+} from './authRouting.js'
+import { hasUsableOpenAICredential } from './credentialPool.js'
+import { getApiTimeoutMs } from './openaiShim/transport.js'
+import { AnthropicVertex } from './vertexClient.js'
+import { importOptionalRuntimeModule } from '../../utils/optionalRuntimeModule.js'
 
-const importRuntimeModule = new Function(
-  'specifier',
-  'return import(specifier)',
-) as (specifier: string) => Promise<any>
+type OptionalRuntimeImporter = typeof importOptionalRuntimeModule
+
+let importOptionalRuntimeModuleForClient: OptionalRuntimeImporter =
+  importOptionalRuntimeModule
+
+export function _setOptionalRuntimeModuleImporterForTesting(
+  importer?: OptionalRuntimeImporter,
+): void {
+  importOptionalRuntimeModuleForClient = importer ?? importOptionalRuntimeModule
+}
 
 /**
  * Environment variables for different client types:
@@ -96,6 +132,393 @@ function createStderrLogger(): ClientOptions['logger'] {
   }
 }
 
+function isMiniMaxModelName(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase()
+  return Boolean(
+    normalized &&
+      (normalized.startsWith('minimax-') || normalized.startsWith('minimax/')),
+  )
+}
+
+function hasMiniMaxModelIntent(model: string | undefined): boolean {
+  return (
+    isMiniMaxModelName(model) ||
+    isMiniMaxModelName(process.env.OPENAI_MODEL) ||
+    isMiniMaxModelName(process.env.ANTHROPIC_MODEL)
+  )
+}
+
+function hasConflictingOpenAIBaseUrlForMiniMax(): boolean {
+  const openAIBaseUrl =
+    process.env.OPENAI_BASE_URL?.trim() || process.env.OPENAI_API_BASE?.trim()
+  return Boolean(openAIBaseUrl && !isMiniMaxBaseUrl(openAIBaseUrl))
+}
+
+function shouldUseMiniMaxEnvOnlyProvider(
+  model: string | undefined,
+  envOnlyProviderRouteId: string | null,
+): boolean {
+  // An explicit OpenAI endpoint selects its wire protocol, even with a
+  // dedicated MiniMax key. Native defaults must not rewrite that request.
+  if (
+    isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI) &&
+    isMiniMaxBaseUrl(
+      process.env.OPENAI_BASE_URL?.trim() || process.env.OPENAI_API_BASE?.trim(),
+    )
+  ) {
+    return false
+  }
+
+  const hasMiniMaxCredential =
+    process.env.MINIMAX_API_KEY?.trim() ||
+    (getMiniMaxBaseUrlOverride() !== undefined &&
+      process.env.ANTHROPIC_API_KEY?.trim())
+
+  if (!hasMiniMaxCredential) {
+    return false
+  }
+
+  if (envOnlyProviderRouteId === 'minimax') {
+    return true
+  }
+
+  return (
+    (hasMiniMaxModelIntent(model) || getMiniMaxBaseUrlOverride() !== undefined) &&
+    !hasConflictingOpenAIBaseUrlForMiniMax()
+  )
+}
+
+function isXaiModelName(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase()
+  return Boolean(
+    normalized &&
+      (normalized.startsWith('grok-') || normalized.startsWith('xai/')),
+  )
+}
+
+function applyMiniMaxEnvOnlyDefaults(model: string | undefined): void {
+  const baseUrlOverride = getMiniMaxBaseUrlOverride()
+  const validationError = getMiniMaxBaseUrlValidationError(baseUrlOverride)
+  if (validationError) throw new Error(validationError)
+  // ANTHROPIC_BASE_URL already describes the native endpoint. Legacy OpenAI
+  // URL hints select the region, but still need the native /anthropic path.
+  const baseUrl = isMiniMaxBaseUrl(process.env.ANTHROPIC_BASE_URL)
+    ? process.env.ANTHROPIC_BASE_URL!.trim()
+    : baseUrlOverride
+      ? new URL('/anthropic', baseUrlOverride).toString()
+      : getRouteDefaultBaseUrl('minimax')
+
+  const modelOverride =
+    (isMiniMaxModelName(model) ? model?.trim() : undefined) ??
+    process.env.OPENAI_MODEL?.trim() ??
+    process.env.ANTHROPIC_MODEL?.trim() ??
+    undefined
+
+  const apiKey =
+    process.env.MINIMAX_API_KEY?.trim() ||
+    process.env.ANTHROPIC_API_KEY?.trim()
+  if (apiKey) {
+    process.env.ANTHROPIC_API_KEY = apiKey
+  }
+
+  process.env.ANTHROPIC_BASE_URL = baseUrl
+  process.env.ANTHROPIC_MODEL =
+    (isMiniMaxModelName(modelOverride)
+      ? modelOverride
+      : undefined) ??
+    getRouteDefaultModel('minimax')
+  delete process.env.CLAUDE_CODE_USE_OPENAI
+  delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
+  delete process.env.OPENAI_AUTH_HEADER
+  delete process.env.OPENAI_AUTH_SCHEME
+  delete process.env.OPENAI_AUTH_HEADER_VALUE
+}
+
+function isXiaomiMimoModelName(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase()
+  return Boolean(
+    normalized &&
+      (normalized.startsWith('mimo-') || normalized.startsWith('mimo/')),
+  )
+}
+
+function applyXiaomiMimoEnvOnlyDefaults(): void {
+  const baseUrlOverride = getXiaomiMimoBaseUrlOverride()
+  const hasBaseOverride = baseUrlOverride !== undefined
+  const modelOverride = process.env.OPENAI_MODEL?.trim() || undefined
+
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL =
+    baseUrlOverride ?? getRouteDefaultBaseUrl('xiaomi-mimo')
+  process.env.OPENAI_MODEL =
+    (hasBaseOverride || isXiaomiMimoModelName(modelOverride)
+      ? modelOverride
+      : undefined) ??
+    getRouteDefaultModel('xiaomi-mimo')
+  process.env.OPENAI_API_KEY = process.env.MIMO_API_KEY
+  delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
+  delete process.env.OPENAI_AUTH_HEADER
+  delete process.env.OPENAI_AUTH_SCHEME
+  delete process.env.OPENAI_AUTH_HEADER_VALUE
+}
+
+function applyXaiEnvOnlyDefaults(): void {
+  const baseUrlOverride = getXaiBaseUrlOverride()
+  const hasXaiBaseOverride = baseUrlOverride !== undefined
+  const modelOverride = process.env.OPENAI_MODEL?.trim() || undefined
+
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL =
+    baseUrlOverride ?? getRouteDefaultBaseUrl('xai')
+  process.env.OPENAI_MODEL =
+    (hasXaiBaseOverride || isXaiModelName(modelOverride)
+      ? modelOverride
+      : undefined) ??
+    getRouteDefaultModel('xai')
+  process.env.OPENAI_API_KEY = process.env.XAI_API_KEY
+  delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
+  delete process.env.OPENAI_AUTH_HEADER
+  delete process.env.OPENAI_AUTH_SCHEME
+  delete process.env.OPENAI_AUTH_HEADER_VALUE
+}
+
+const NEARAI_MODEL_PREFIXES = [
+  'anthropic/',
+  'openai/',
+  'google/',
+  'zai-org/',
+  'qwen/',
+  'moonshotai/',
+]
+
+function isNearaiModelName(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase()
+  if (!normalized) return false
+  return NEARAI_MODEL_PREFIXES.some(prefix => normalized.startsWith(prefix))
+}
+
+function applyNearaiEnvOnlyDefaults(): void {
+  const baseUrlOverride = getNearaiBaseUrlOverride()
+  const hasNearaiBaseOverride = baseUrlOverride !== undefined
+  const modelOverride = process.env.OPENAI_MODEL?.trim() || undefined
+
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL =
+    baseUrlOverride ?? getRouteDefaultBaseUrl('nearai')
+  process.env.OPENAI_MODEL =
+    (hasNearaiBaseOverride || isNearaiModelName(modelOverride)
+      ? modelOverride
+      : undefined) ??
+    getRouteDefaultModel('nearai')
+  process.env.OPENAI_API_KEY = process.env.NEARAI_API_KEY
+  delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
+  delete process.env.OPENAI_AUTH_HEADER
+  delete process.env.OPENAI_AUTH_SCHEME
+  delete process.env.OPENAI_AUTH_HEADER_VALUE
+}
+
+/**
+ * Checks whether the given model ID follows the Fireworks AI model naming
+ * convention (`accounts/fireworks/models/...`).
+ */
+function isFireworksModelName(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase()
+  return Boolean(
+    normalized && normalized.startsWith('accounts/fireworks/models/'),
+  )
+}
+
+/**
+ * Applies Fireworks AI environment defaults by setting the OpenAI shim env
+ * vars (`CLAUDE_CODE_USE_OPENAI`, `OPENAI_BASE_URL`, `OPENAI_MODEL`,
+ * `OPENAI_API_KEY`) and clearing stale OpenAI shim options.
+ */
+function applyFireworksEnvOnlyDefaults(): void {
+  const baseUrlOverride = getFireworksBaseUrlOverride()
+  const hasFireworksBaseOverride = baseUrlOverride !== undefined
+  const modelOverride = process.env.OPENAI_MODEL?.trim() || undefined
+
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL =
+    baseUrlOverride ?? getRouteDefaultBaseUrl('fireworks')
+  process.env.OPENAI_MODEL =
+    (hasFireworksBaseOverride || isFireworksModelName(modelOverride)
+      ? modelOverride
+      : undefined) ??
+    getRouteDefaultModel('fireworks')
+  process.env.OPENAI_API_KEY = process.env.FIREWORKS_API_KEY
+  delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
+  delete process.env.OPENAI_AUTH_HEADER
+  delete process.env.OPENAI_AUTH_SCHEME
+  delete process.env.OPENAI_AUTH_HEADER_VALUE
+}
+
+function isLongcatModelName(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase()
+  return Boolean(normalized && normalized.startsWith('longcat'))
+}
+
+function applyLongcatEnvOnlyDefaults(): void {
+  const baseUrlOverride = getLongcatBaseUrlOverride()
+  const hasLongcatBaseOverride = baseUrlOverride !== undefined
+  const modelOverride = process.env.OPENAI_MODEL?.trim() || undefined
+
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL =
+    baseUrlOverride ?? getRouteDefaultBaseUrl('longcat')
+  process.env.OPENAI_MODEL =
+    (hasLongcatBaseOverride || isLongcatModelName(modelOverride)
+      ? modelOverride
+      : undefined) ??
+    getRouteDefaultModel('longcat')
+  process.env.OPENAI_API_KEY = process.env.LONGCAT_API_KEY
+  delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
+  delete process.env.OPENAI_AUTH_HEADER
+  delete process.env.OPENAI_AUTH_SCHEME
+  delete process.env.OPENAI_AUTH_HEADER_VALUE
+}
+
+function applyAimlapiEnvOnlyDefaults(): void {
+  const baseUrlOverride =
+    process.env.OPENAI_BASE_URL?.trim() ||
+    process.env.OPENAI_API_BASE?.trim() ||
+    undefined
+  const modelOverride = process.env.OPENAI_MODEL?.trim() || undefined
+
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL =
+    baseUrlOverride ?? getRouteDefaultBaseUrl('aimlapi')
+  process.env.OPENAI_MODEL = modelOverride ?? getRouteDefaultModel('aimlapi')
+  process.env.OPENAI_API_KEY = process.env.AIMLAPI_API_KEY
+  delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
+  delete process.env.OPENAI_AUTH_HEADER
+  delete process.env.OPENAI_AUTH_SCHEME
+  delete process.env.OPENAI_AUTH_HEADER_VALUE
+}
+
+function applyApismartEnvOnlyDefaults(): void {
+  const baseUrlOverride =
+    usableProviderConfigEnvValue(process.env.OPENAI_BASE_URL) ||
+    usableProviderConfigEnvValue(process.env.OPENAI_API_BASE) ||
+    undefined
+  const modelOverride =
+    usableProviderConfigEnvValue(process.env.APISMART_MODEL) ||
+    usableProviderConfigEnvValue(process.env.OPENAI_MODEL) ||
+    undefined
+  const apiKey = process.env.APISMART_API_KEY
+
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL =
+    baseUrlOverride ?? getRouteDefaultBaseUrl('apismart')
+  process.env.OPENAI_MODEL = modelOverride ?? getRouteDefaultModel('apismart')
+  // Mirror only a usable dedicated key. Template placeholders must not become
+  // OPENAI_API_KEY side effects for later routes in this process. A same-host
+  // URL alone is not enough: the dedicated key belongs only to ApiSmart's
+  // documented /v1 inference endpoint.
+  if (
+    hasUsableOpenAICredential(apiKey) &&
+    isCanonicalApismartInferenceBaseUrl(process.env.OPENAI_BASE_URL)
+  ) {
+    process.env.OPENAI_API_KEY = apiKey
+  } else {
+    delete process.env.OPENAI_API_KEY
+  }
+  delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
+  delete process.env.OPENAI_AUTH_HEADER
+  delete process.env.OPENAI_AUTH_SCHEME
+  delete process.env.OPENAI_AUTH_HEADER_VALUE
+  delete process.env.ANTHROPIC_CUSTOM_HEADERS
+}
+
+function applyConcentrateEnvOnlyDefaults(): void {
+  const baseUrlOverride =
+    usableProviderConfigEnvValue(process.env.CONCENTRATE_BASE_URL) ||
+    usableProviderConfigEnvValue(process.env.OPENAI_BASE_URL) ||
+    usableProviderConfigEnvValue(process.env.OPENAI_API_BASE) ||
+    undefined
+  const modelOverride =
+    usableProviderConfigEnvValue(process.env.CONCENTRATE_MODEL) ||
+    usableProviderConfigEnvValue(process.env.OPENAI_MODEL) ||
+    undefined
+  const apiKey = process.env.CONCENTRATE_API_KEY
+
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL =
+    baseUrlOverride ?? getRouteDefaultBaseUrl('concentrate')
+  process.env.OPENAI_MODEL = modelOverride ?? getRouteDefaultModel('concentrate')
+  // A dedicated key explicitly selects Concentrate. Mirror it into
+  // OPENAI_API_KEY for the shared transport and avoid forwarding a stale
+  // generic credential. Generic OpenAI credentials remain supported when the
+  // user explicitly configures the canonical Concentrate base URL without the
+  // dedicated selection key.
+  if (
+    hasUsableOpenAICredential(apiKey) &&
+    isCanonicalConcentrateInferenceBaseUrl(process.env.OPENAI_BASE_URL)
+  ) {
+    process.env.OPENAI_API_KEY = apiKey
+  } else {
+    delete process.env.OPENAI_API_KEY
+  }
+  delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
+  delete process.env.OPENAI_AUTH_HEADER
+  delete process.env.OPENAI_AUTH_SCHEME
+  delete process.env.OPENAI_AUTH_HEADER_VALUE
+  delete process.env.ANTHROPIC_CUSTOM_HEADERS
+}
+
+function applyApiRouteEnvOnlyDefaults(): void {
+  const baseUrlOverride =
+    usableProviderConfigEnvValue(process.env.OPENAI_BASE_URL) ||
+    usableProviderConfigEnvValue(process.env.OPENAI_API_BASE) ||
+    undefined
+  const modelOverride =
+    usableProviderConfigEnvValue(process.env.API_ROUTE_MODEL) ||
+    usableProviderConfigEnvValue(process.env.OPENAI_MODEL) ||
+    undefined
+  const apiKey = process.env.API_ROUTE_API_KEY
+
+  process.env.CLAUDE_CODE_USE_OPENAI = '1'
+  process.env.OPENAI_BASE_URL =
+    baseUrlOverride ?? getRouteDefaultBaseUrl('api-route')
+  process.env.OPENAI_MODEL = modelOverride ?? getRouteDefaultModel('api-route')
+  if (
+    hasUsableOpenAICredential(apiKey) &&
+    isCanonicalApiRouteInferenceBaseUrl(process.env.OPENAI_BASE_URL)
+  ) {
+    process.env.OPENAI_API_KEY = apiKey
+    delete process.env.OPENAI_API_KEYS
+  } else {
+    delete process.env.OPENAI_API_KEY
+    delete process.env.OPENAI_API_KEYS
+  }
+  delete process.env.OPENAI_API_FORMAT
+  delete process.env.OPENAI_AZURE_STYLE
+  delete process.env.OPENAI_AUTH_HEADER
+  delete process.env.OPENAI_AUTH_SCHEME
+  delete process.env.OPENAI_AUTH_HEADER_VALUE
+  delete process.env.ANTHROPIC_CUSTOM_HEADERS
+}
+
+function usableProviderConfigEnvValue(
+  value: string | undefined,
+): string | undefined {
+  const trimmed = value?.trim()
+  if (!trimmed) return undefined
+  const normalized = trimmed.toLowerCase()
+  return normalized === 'undefined' || normalized === 'null'
+    ? undefined
+    : trimmed
+}
+
 export async function getAnthropicClient({
   apiKey,
   maxRetries,
@@ -115,10 +538,113 @@ export async function getAnthropicClient({
 }): Promise<Anthropic> {
   // Convert the runtime effort value to the OpenAI-shaped enum the shim
   // expects. Undefined → shim falls back to descriptor/alias defaults.
-  const shimReasoningEffort: OpenAIEffortLevel | undefined =
-    effortValue !== undefined
-      ? standardEffortToOpenAI(convertEffortValueToLevel(effortValue))
+  const effortProcessEnv = providerOverride
+    ? { ...process.env, OPENAI_AZURE_STYLE: undefined }
+    : process.env
+  const effortModel = providerOverride?.model ?? model
+  const effortBaseUrl =
+    providerOverride?.baseURL ??
+    process.env.OPENAI_BASE_URL ??
+    process.env.OPENAI_API_BASE
+  const effortRuntimeContext = effortModel
+    ? resolveOpenAIShimRuntimeContext({
+      processEnv: effortProcessEnv,
+      baseUrl: effortBaseUrl,
+      model: effortModel,
+      preferBaseUrlRoute:
+        providerOverride !== undefined || isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI),
+    })
+    : undefined
+  const effortShimConfig = effortRuntimeContext?.openaiShimConfig
+  const effortContext = effortRuntimeContext
+      ? {
+        routeId: effortRuntimeContext.routeId ?? 'custom',
+        useRuntimeFallback: false,
+        openaiShimConfig: effortShimConfig,
+        baseUrl: effortBaseUrl,
+        processEnv: effortProcessEnv,
+        // Per-agent overrides always use the OpenAI-compatible shim, regardless
+        // of the parent session's provider.
+        apiProvider: providerOverride ? 'openai' as const : getAPIProvider(),
+      }
+    : undefined
+  const supportsShimReasoningEffort = effortModel
+    ? effortShimConfig
+      ? modelSupportsShimReasoningEffort(
+        effortModel,
+        effortShimConfig.thinkingRequestFormat,
+        effortShimConfig.removeBodyFields,
+        effortContext,
+      )
+      : modelSupportsWireEffort(effortModel, effortContext)
+    : false
+  const reasoningControl = effortModel
+    ? resolveModelReasoningControl(effortModel, effortContext)
+    : undefined
+  const k3ReasoningControl =
+    reasoningControl?.source === 'metadata' &&
+    reasoningControl.wireFormat === 'reasoning_effort' &&
+    reasoningControl.levels.length === 3 &&
+    reasoningControl.levels.includes('low') &&
+    reasoningControl.levels.includes('high') &&
+    reasoningControl.levels.includes('max')
+  const appliedEffort = effortModel && effortValue !== undefined
+    ? resolveAppliedEffort(
+      effortModel,
+      effortValue,
+      effortContext,
+    )
+    : undefined
+  const appliedEffortLevel = appliedEffort === undefined
+    ? undefined
+    : convertEffortValueToLevel(appliedEffort)
+  const shimReasoningEffort: OpenAIShimEffortLevel | undefined =
+    appliedEffortLevel !== undefined && supportsShimReasoningEffort
+      ? (reasoningControl?.source === 'metadata' &&
+          reasoningControl.wireFormat === 'reasoning_effort' &&
+          appliedEffortLevel === 'max' &&
+          k3ReasoningControl
+            ? 'max'
+          : standardEffortToOpenAI(appliedEffortLevel))
       : undefined
+  // Normalize env-only routes before snapshotting custom headers. Dedicated
+  // routes such as Concentrate deliberately clear inherited proxy headers;
+  // doing that after getCustomHeaders() would leave a copied secret in the
+  // request defaults.
+  const envOnlyProviderRouteId = resolveEnvOnlyProviderRouteId(process.env)
+  const useMiniMaxEnvOnlyProvider = shouldUseMiniMaxEnvOnlyProvider(
+    model,
+    envOnlyProviderRouteId,
+  )
+  const useXiaomiMimoEnvOnlyProvider =
+    envOnlyProviderRouteId === 'xiaomi-mimo' && !useMiniMaxEnvOnlyProvider
+  const useXaiEnvOnlyProvider =
+    envOnlyProviderRouteId === 'xai' && !useMiniMaxEnvOnlyProvider
+  const useNearaiEnvOnlyProvider =
+    envOnlyProviderRouteId === 'nearai' && !useMiniMaxEnvOnlyProvider
+  const useFireworksEnvOnlyProvider =
+    envOnlyProviderRouteId === 'fireworks' && !useMiniMaxEnvOnlyProvider
+  const useLongcatEnvOnlyProvider =
+    envOnlyProviderRouteId === 'longcat' && !useMiniMaxEnvOnlyProvider
+  const useAimlapiEnvOnlyProvider =
+    envOnlyProviderRouteId === 'aimlapi' && !useMiniMaxEnvOnlyProvider
+  const useApismartEnvOnlyProvider =
+    envOnlyProviderRouteId === 'apismart' && !useMiniMaxEnvOnlyProvider
+  const useConcentrateEnvOnlyProvider =
+    envOnlyProviderRouteId === 'concentrate' && !useMiniMaxEnvOnlyProvider
+  const useApiRouteEnvOnlyProvider =
+    envOnlyProviderRouteId === 'api-route' && !useMiniMaxEnvOnlyProvider
+  if (useMiniMaxEnvOnlyProvider) applyMiniMaxEnvOnlyDefaults(model)
+  if (useXiaomiMimoEnvOnlyProvider) applyXiaomiMimoEnvOnlyDefaults()
+  if (useXaiEnvOnlyProvider) applyXaiEnvOnlyDefaults()
+  if (useNearaiEnvOnlyProvider) applyNearaiEnvOnlyDefaults()
+  if (useFireworksEnvOnlyProvider) applyFireworksEnvOnlyDefaults()
+  if (useLongcatEnvOnlyProvider) applyLongcatEnvOnlyDefaults()
+  if (useAimlapiEnvOnlyProvider) applyAimlapiEnvOnlyDefaults()
+  if (useApismartEnvOnlyProvider) applyApismartEnvOnlyDefaults()
+  if (useConcentrateEnvOnlyProvider) applyConcentrateEnvOnlyDefaults()
+  if (useApiRouteEnvOnlyProvider) applyApiRouteEnvOnlyDefaults()
+
   const containerId = process.env.CLAUDE_CODE_CONTAINER_ID
   const remoteSessionId = process.env.CLAUDE_CODE_REMOTE_SESSION_ID
   const clientApp = process.env.CLAUDE_AGENT_SDK_CLIENT_APP
@@ -149,12 +675,49 @@ export async function getAnthropicClient({
     defaultHeaders['x-anthropic-additional-protection'] = 'true'
   }
 
-  logForDebugging('[API:auth] OAuth token check starting')
-  await checkAndRefreshOAuthTokenIfNeeded()
-  logForDebugging('[API:auth] OAuth token check complete')
+  const apiProvider = getAPIProvider()
+  const isFirstPartyBaseUrl = isFirstPartyAnthropicBaseUrl()
+  const shouldUseFirstPartyAuth = shouldUseFirstPartyAnthropicAuthForProvider({
+    providerOverride,
+    apiProvider,
+    isFirstPartyBaseUrl,
+  })
+  const useMiniMaxNativeProvider =
+    useMiniMaxEnvOnlyProvider ||
+    (getAPIProvider() === 'minimax' &&
+      !isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI))
 
-  if (!isClaudeAISubscriber()) {
-    await configureApiKeyHeaders(defaultHeaders, getIsNonInteractiveSession())
+  if (shouldUseFirstPartyAuth) {
+    logForDebugging('[API:auth] OAuth token check starting')
+    await checkAndRefreshOAuthTokenIfNeeded()
+    logForDebugging('[API:auth] OAuth token check complete')
+  }
+
+  const isClaudeAiSubscriber =
+    shouldUseFirstPartyAuth && isClaudeAISubscriber()
+  const anthropicAuthToken = process.env.ANTHROPIC_AUTH_TOKEN?.trim()
+  const usesCustomAnthropicAuthToken = shouldUseCustomAnthropicBearerAuth({
+    providerOverride,
+    apiProvider,
+    isFirstPartyBaseUrl,
+    authToken: anthropicAuthToken,
+  })
+
+  if (
+    (shouldUseFirstPartyAuth && !isClaudeAiSubscriber) ||
+    usesCustomAnthropicAuthToken
+  ) {
+    await configureApiKeyHeaders(
+      defaultHeaders,
+      getIsNonInteractiveSession(),
+      usesCustomAnthropicAuthToken ? anthropicAuthToken : undefined,
+    )
+  } else if (apiProvider === 'firstParty' && !isFirstPartyBaseUrl) {
+    removeManagedAnthropicAuthHeaders(defaultHeaders)
+    const anthropicApiKey = process.env.ANTHROPIC_API_KEY?.trim()
+    if (anthropicApiKey) {
+      defaultHeaders['X-Api-Key'] = anthropicApiKey
+    }
   }
 
   const resolvedFetch = buildFetch(fetchOverride, source)
@@ -162,7 +725,7 @@ export async function getAnthropicClient({
   const ARGS = {
     defaultHeaders,
     maxRetries,
-    timeout: parseInt(process.env.API_TIMEOUT_MS || String(600 * 1000), 10),
+    timeout: getApiTimeoutMs(),
     dangerouslyAllowBrowser: true,
     fetchOptions: getProxyFetchOptions({
       forAnthropicAPI: true,
@@ -185,7 +748,7 @@ export async function getAnthropicClient({
     return createOpenAIShimClient({
       defaultHeaders: safeHeaders,
       maxRetries,
-      timeout: parseInt(process.env.API_TIMEOUT_MS || String(600 * 1000), 10),
+      timeout: getApiTimeoutMs(),
       providerOverride,
       reasoningEffort: shimReasoningEffort,
     }) as unknown as Anthropic
@@ -210,6 +773,13 @@ export async function getAnthropicClient({
     return new Anthropic(nativeArgs)
   }
   if (
+    useXiaomiMimoEnvOnlyProvider ||
+    useXaiEnvOnlyProvider ||
+    useNearaiEnvOnlyProvider ||
+    useFireworksEnvOnlyProvider ||
+    useAimlapiEnvOnlyProvider ||
+    useApismartEnvOnlyProvider ||
+    useConcentrateEnvOnlyProvider ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_OPENAI) ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB) ||
     isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI) ||
@@ -219,12 +789,20 @@ export async function getAnthropicClient({
     return createOpenAIShimClient({
       defaultHeaders,
       maxRetries,
-      timeout: parseInt(process.env.API_TIMEOUT_MS || String(600 * 1000), 10),
+      timeout: getApiTimeoutMs(),
       reasoningEffort: shimReasoningEffort,
     }) as unknown as Anthropic
   }
   if (isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK)) {
-    const { AnthropicBedrock } = await import('@anthropic-ai/bedrock-sdk')
+    // Loaded via the runtime importer (not a static `import()`), so esbuild
+    // stays blind to it and does NOT inline @anthropic-ai/bedrock-sdk — which
+    // statically imports @aws-sdk/client-bedrock-runtime. Inlining would hoist
+    // that AWS import into the CLI bundle and require it at startup for every
+    // user. Keeping it lazy means only Bedrock users install the SDK (which
+    // pulls @aws-sdk transitively).
+    const { AnthropicBedrock } = await importOptionalRuntimeModuleForClient<
+      typeof import('@anthropic-ai/bedrock-sdk')
+    >('@anthropic-ai/bedrock-sdk', 'AWS Bedrock')
     // Use region override for small fast model if specified
     const awsRegion =
       model === getSmallFastModel() &&
@@ -232,7 +810,10 @@ export async function getAnthropicClient({
         ? process.env.ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION
         : getAWSRegion()
 
-    const bedrockArgs: ConstructorParameters<typeof AnthropicBedrock>[0] = {
+    // Typed as the SDK's ClientOptions (not ConstructorParameters) because
+    // credentials are filled in conditionally below, which the constructor's
+    // statically-discriminated credential overloads can't express.
+    const bedrockArgs: import('@anthropic-ai/bedrock-sdk').ClientOptions = {
       ...ARGS,
       awsRegion,
       ...(isEnvTruthy(process.env.CLAUDE_CODE_SKIP_BEDROCK_AUTH) && {
@@ -259,12 +840,15 @@ export async function getAnthropicClient({
       }
     }
     // we have always been lying about the return type - this doesn't support batching or models
-    return new AnthropicBedrock(bedrockArgs) as unknown as Anthropic
+    // Cast: the overloads demand a statically-known credential shape; ours is runtime-conditional.
+    return new AnthropicBedrock(
+      bedrockArgs as ConstructorParameters<typeof AnthropicBedrock>[0],
+    ) as unknown as Anthropic
   }
   if (isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)) {
-    const { AnthropicFoundry } = await importRuntimeModule(
-      '@anthropic-ai/foundry-sdk',
-    )
+    const { AnthropicFoundry } = await importOptionalRuntimeModuleForClient<
+      typeof import('@anthropic-ai/foundry-sdk')
+    >('@anthropic-ai/foundry-sdk', 'Azure Foundry')
     // Determine Azure AD token provider based on configuration
     // SDK reads ANTHROPIC_FOUNDRY_API_KEY by default
     let azureADTokenProvider: (() => Promise<string>) | undefined
@@ -277,7 +861,10 @@ export async function getAnthropicClient({
         const {
           DefaultAzureCredential: AzureCredential,
           getBearerTokenProvider,
-        } = await importRuntimeModule('@azure/identity')
+        } =
+          await importOptionalRuntimeModuleForClient<
+            typeof import('@azure/identity')
+          >('@azure/identity', 'Azure Foundry authentication')
         azureADTokenProvider = getBearerTokenProvider(
           new AzureCredential(),
           'https://cognitiveservices.azure.com/.default',
@@ -300,10 +887,6 @@ export async function getAnthropicClient({
       await refreshGcpCredentialsIfNeeded()
     }
 
-    const [{ AnthropicVertex }, { GoogleAuth }] = await Promise.all([
-      importRuntimeModule('@anthropic-ai/vertex-sdk'),
-      importRuntimeModule('google-auth-library'),
-    ])
     // TODO: Cache either GoogleAuth instance or AuthClient to improve performance
     // Currently we create a new GoogleAuth instance for every getAnthropicClient() call
     // This could cause repeated authentication flows and metadata server checks
@@ -338,33 +921,42 @@ export async function getAnthropicClient({
       process.env['GOOGLE_APPLICATION_CREDENTIALS'] ||
       process.env['google_application_credentials']
 
-    const googleAuth = isEnvTruthy(process.env.CLAUDE_CODE_SKIP_VERTEX_AUTH)
-      ? ({
-          // Mock GoogleAuth for testing/proxy scenarios
-          getClient: () => ({
-            getRequestHeaders: () => ({}),
-          }),
-        } as {
-          getClient: () => {
-            getRequestHeaders: () => Record<string, string>
-          }
-        })
-      : new GoogleAuth({
-          scopes: ['https://www.googleapis.com/auth/cloud-platform'],
-          // Only use ANTHROPIC_VERTEX_PROJECT_ID as last resort fallback
-          // This prevents the 12-second metadata server timeout when:
-          // - No project env vars are set AND
-          // - No credential keyfile is specified AND
-          // - ADC file exists but lacks project_id field
-          //
-          // Risk: If auth project != API target project, this could cause billing/audit issues
-          // Mitigation: Users can set GOOGLE_CLOUD_PROJECT to override
-          ...(hasProjectEnvVar || hasKeyFile
-            ? {}
-            : {
-                projectId: process.env.ANTHROPIC_VERTEX_PROJECT_ID,
-              }),
-        })
+    let googleAuth: {
+      getClient: () => { getRequestHeaders: () => Record<string, string> }
+    }
+    if (isEnvTruthy(process.env.CLAUDE_CODE_SKIP_VERTEX_AUTH)) {
+      // Mock GoogleAuth for testing/proxy scenarios. This path intentionally
+      // does NOT load google-auth-library — proxy/test runs must work even when
+      // the optional package is absent (it is only needed for real auth below).
+      googleAuth = {
+        getClient: () => ({
+          getRequestHeaders: () => ({}),
+        }),
+      }
+    } else {
+      const { GoogleAuth } = await importOptionalRuntimeModuleForClient<
+        typeof import('google-auth-library')
+      >('google-auth-library', 'Vertex AI (GCP) authentication')
+      // The real GoogleAuth (async getClient) is wider than the minimal shape
+      // declared above and shared with the mock; AnthropicVertex accepts it at
+      // runtime, so narrow it back to the shared shape here.
+      googleAuth = new GoogleAuth({
+        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+        // Only use ANTHROPIC_VERTEX_PROJECT_ID as last resort fallback
+        // This prevents the 12-second metadata server timeout when:
+        // - No project env vars are set AND
+        // - No credential keyfile is specified AND
+        // - ADC file exists but lacks project_id field
+        //
+        // Risk: If auth project != API target project, this could cause billing/audit issues
+        // Mitigation: Users can set GOOGLE_CLOUD_PROJECT to override
+        ...(hasProjectEnvVar || hasKeyFile
+          ? {}
+          : {
+              projectId: process.env.ANTHROPIC_VERTEX_PROJECT_ID,
+            }),
+      }) as unknown as typeof googleAuth
+    }
 
     const vertexArgs = {
       ...ARGS,
@@ -378,15 +970,29 @@ export async function getAnthropicClient({
 
   // Determine authentication method based on available tokens
   const clientConfig: ConstructorParameters<typeof Anthropic>[0] = {
-    apiKey: isClaudeAISubscriber() ? null : apiKey || getAnthropicApiKey(),
-    authToken: isClaudeAISubscriber()
+    apiKey: isClaudeAiSubscriber || usesCustomAnthropicAuthToken
+      ? null
+      : useMiniMaxNativeProvider
+        ? process.env.MINIMAX_API_KEY || process.env.ANTHROPIC_API_KEY
+        : apiKey ||
+          (!isFirstPartyBaseUrl
+            ? process.env.ANTHROPIC_API_KEY?.trim()
+            : getAnthropicApiKey()),
+    // Pass an explicit null for non-Bearer routes so the SDK cannot fall back
+    // to ANTHROPIC_AUTH_TOKEN from its own environment lookup.
+    authToken: isClaudeAiSubscriber
       ? getClaudeAIOAuthTokens()?.accessToken
-      : undefined,
+      : usesCustomAnthropicAuthToken
+        ? anthropicAuthToken
+        : null,
     // Set baseURL from OAuth config when using staging OAuth
-    ...(process.env.USER_TYPE === 'ant' &&
+    ...(shouldUseFirstPartyAuth &&
+    process.env.USER_TYPE === 'ant' &&
     isEnvTruthy(process.env.USE_STAGING_OAUTH)
       ? { baseURL: getOauthConfig().BASE_API_URL }
-      : {}),
+      : process.env.ANTHROPIC_BASE_URL
+        ? { baseURL: process.env.ANTHROPIC_BASE_URL.replace(/\/v1\/?$/i, '') }
+        : {}),
     ...ARGS,
     ...(isDebugToStdErr() && { logger: createStderrLogger() }),
   }
@@ -397,13 +1003,27 @@ export async function getAnthropicClient({
 async function configureApiKeyHeaders(
   headers: Record<string, string>,
   isNonInteractiveSession: boolean,
+  authToken?: string,
 ): Promise<void> {
-  const token =
-    process.env.ANTHROPIC_AUTH_TOKEN ||
-    (await getApiKeyFromApiKeyHelper(isNonInteractiveSession))
+  const token = authToken || (await getApiKeyFromApiKeyHelper(isNonInteractiveSession))
   if (token) {
+    removeManagedAnthropicAuthHeaders(headers)
     headers['Authorization'] = `Bearer ${token}`
   }
+}
+
+function removeManagedAnthropicAuthHeaders(headers: Record<string, string>): void {
+  for (const name of Object.keys(headers)) {
+    const lower = name.toLowerCase()
+    if (lower === 'authorization' || lower === 'x-api-key' || lower === 'api-key') {
+      delete headers[name]
+    }
+  }
+  // The Anthropic SDK also reads ANTHROPIC_CUSTOM_HEADERS. Null sentinels clear
+  // those env-parsed managed auth headers before the supported credential wins.
+  headers.Authorization = null as unknown as string
+  headers['X-Api-Key'] = null as unknown as string
+  headers['api-key'] = null as unknown as string
 }
 
 function getCustomHeaders(): Record<string, string> {
@@ -412,19 +1032,24 @@ function getCustomHeaders(): Record<string, string> {
 
   if (!customHeadersEnv) return customHeaders
 
-  // Split by newlines to support multiple headers
-  const headerStrings = customHeadersEnv.split(/\n|\r\n/)
+  // Reject raw CR characters — these indicate a header value containing \r\n
+  // that would be split into an injected header entry after splitting.
+  if (customHeadersEnv.includes('\r')) return customHeaders
 
-  for (const headerString of headerStrings) {
+  // Split by newlines to support multiple headers (intentional \n delimiters)
+  for (const headerString of customHeadersEnv.split('\n')) {
     if (!headerString.trim()) continue
-
-    // Parse header in format "Name: Value" (curl style). Split on first `:`
-    // then trim — avoids regex backtracking on malformed long header lines.
     const colonIdx = headerString.indexOf(':')
     if (colonIdx === -1) continue
     const name = headerString.slice(0, colonIdx).trim()
     const value = headerString.slice(colonIdx + 1).trim()
-    if (name) {
+    const lowerName = name.toLowerCase()
+    if (
+      name &&
+      lowerName !== 'authorization' &&
+      lowerName !== 'x-api-key' &&
+      lowerName !== 'api-key'
+    ) {
       customHeaders[name] = value
     }
   }

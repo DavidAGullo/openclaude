@@ -1,4 +1,7 @@
+import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs'
 import { Ajv } from 'ajv'
+import Ajv2020 from 'ajv/dist/2020.js'
+import type { ValidateFunction } from 'ajv'
 import { z } from 'zod/v4'
 import { buildTool, type ToolDef, type ValidationResult } from '../../Tool.js'
 import { lazySchema } from '../../utils/lazySchema.js'
@@ -38,7 +41,43 @@ export type Output = z.infer<OutputSchema>
 // Re-export MCPProgress from centralized types to break import cycles
 export type { MCPProgress } from '../../types/tools.js'
 
-const ajv = new Ajv({ strict: false })
+const draft7Ajv = new Ajv({ strict: false })
+const draft202012Ajv = new Ajv2020({ strict: false })
+
+type CompiledValidator = {
+  validate: ValidateFunction
+  errorsText: (errors?: ValidateFunction['errors']) => string
+}
+
+// Cache compiled validators to avoid recompiling on every validateInput call.
+// AJV compilation is expensive — schemas don't change between calls.
+// Uses WeakMap to allow garbage collection of schemas from disconnected/refreshed
+// MCP tools, preventing memory leaks from accumulating strong references.
+const compiledValidatorCache = new WeakMap<object, CompiledValidator>()
+
+function selectAjv(schema: object) {
+  const schemaUri = (schema as Record<string, unknown>)['$schema']
+  if (
+    typeof schemaUri === 'string' &&
+    schemaUri.includes('json-schema.org/draft-07')
+  ) {
+    return draft7Ajv
+  }
+  return draft202012Ajv
+}
+
+function getCompiledValidator(schema: object) {
+  let compiled = compiledValidatorCache.get(schema)
+  if (!compiled) {
+    const ajv = selectAjv(schema)
+    compiled = {
+      validate: ajv.compile(schema),
+      errorsText: errors => ajv.errorsText(errors),
+    }
+    compiledValidatorCache.set(schema, compiled)
+  }
+  return compiled
+}
 
 export const MCPTool = buildTool({
   isMcp: true,
@@ -78,18 +117,21 @@ export const MCPTool = buildTool({
   async validateInput(input, context): Promise<ValidationResult> {
     if (this.inputJSONSchema) {
       try {
-        const validate = ajv.compile(this.inputJSONSchema)
+        const { validate, errorsText } = getCompiledValidator(
+          this.inputJSONSchema,
+        )
         if (!validate(input)) {
           return {
             result: false,
-            message: ajv.errorsText(validate.errors),
+            message: errorsText(validate.errors),
             errorCode: 400,
           }
         }
       } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error)
         return {
           result: false,
-          message: `Failed to compile JSON schema for validation: ${error}`,
+          message: `Failed to compile JSON schema for validation: ${errMsg}`,
           errorCode: 500,
         }
       }
@@ -109,7 +151,8 @@ export const MCPTool = buildTool({
     if (Array.isArray(output)) {
       return output.some(
         block =>
-          block?.type === 'text' &&
+          block != null &&
+          block.type === 'text' &&
           typeof block.text === 'string' &&
           isOutputLineTruncated(block.text),
       )
@@ -117,10 +160,23 @@ export const MCPTool = buildTool({
     return false
   },
   mapToolResultToToolResultBlockParam(content, toolUseID) {
+    // Defensive guard: if content is undefined/null (shouldn't happen after
+    // the abort path fix in client.ts), return a clear indicator rather than
+    // sending undefined to the API which would cause an error.
+    if (content === undefined || content === null) {
+      return {
+        tool_use_id: toolUseID,
+        type: 'tool_result',
+        content: '[No content returned from MCP tool]',
+      }
+    }
     return {
       tool_use_id: toolUseID,
       type: 'tool_result',
-      content,
+      // MCP content blocks are loosely typed ({ type: string }); the actual
+      // values come off the MCP wire as SDK-shaped blocks, so cast at the
+      // API boundary.
+      content: content as ToolResultBlockParam['content'],
     }
   },
 } satisfies ToolDef<InputSchema, Output>)

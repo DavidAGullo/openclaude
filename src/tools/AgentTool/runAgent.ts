@@ -12,8 +12,11 @@ import {
 import type { QuerySource } from '../../constants/querySource.js'
 import { getSystemContext, getUserContext } from '../../context.js'
 import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
+import { createPermissionSessionStateGetter } from '../../hooks/toolPermission/permissionSessionOwnership.js'
 import { query } from '../../query.js'
+import type { Terminal } from '../../query/transitions.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js'
+import type { AppState } from '../../state/AppStateStore.js'
 import { getDumpPromptsPath } from '../../services/api/dumpPrompts.js'
 import { cleanupAgentTracking } from '../../services/api/promptCacheBreakDetection.js'
 import {
@@ -57,9 +60,9 @@ import { clearSessionHooks } from '../../utils/hooks/sessionHooks.js'
 import { executeSubagentStartHooks } from '../../utils/hooks.js'
 import { createUserMessage } from '../../utils/messages.js'
 import { getAgentModel } from '../../utils/model/agent.js'
-import { resolveAgentProvider } from '../../services/api/agentRouting.js'
+import { isModelAllowed } from '../../utils/model/modelAllowlist.js'
+import { resolveAgentRunModelRouting, shouldEnforceModelAllowlist } from '../../services/api/agentRouting.js'
 import { getInitialSettings } from '../../utils/settings/settings.js'
-import type { ModelAlias } from '../../utils/model/aliases.js'
 import {
   clearAgentTranscriptSubdir,
   recordSidechainTranscript,
@@ -74,15 +77,14 @@ import {
   asSystemPrompt,
   type SystemPrompt,
 } from '../../utils/systemPromptType.js'
-import {
-  isPerfettoTracingEnabled,
-  registerAgent as registerPerfettoAgent,
-  unregisterAgent as unregisterPerfettoAgent,
-} from '../../utils/telemetry/perfettoTracing.js'
 import type { ContentReplacementState } from '../../utils/toolResultStorage.js'
 import { createAgentId } from '../../utils/uuid.js'
 import { resolveAgentTools } from './agentToolUtils.js'
 import { type AgentDefinition, isBuiltInAgent } from './loadAgentsDir.js'
+import {
+  canDescendantShowPermissionPrompts,
+  shouldAvoidAgentPermissionPrompts,
+} from './permissionPromptAvailability.js'
 
 /**
  * Initialize agent-specific MCP servers
@@ -259,6 +261,7 @@ export async function* runAgent({
   override,
   model,
   maxTurns,
+  maxSteps,
   preserveToolUseResults,
   availableTools,
   allowedTools,
@@ -266,18 +269,21 @@ export async function* runAgent({
   contentReplacementState,
   useExactTools,
   worktreePath,
+  cwd,
   description,
   transcriptSubdir,
   onQueryProgress,
   agentName,
+  routingSubagentType,
+  permissionSessionState,
 }: {
   agentDefinition: AgentDefinition
   promptMessages: Message[]
   toolUseContext: ToolUseContext
   canUseTool: CanUseToolFn
   isAsync: boolean
-  /** Whether this agent can show permission prompts. Defaults to !isAsync.
-   * Set to true for in-process teammates that run async but share the terminal. */
+  /** Whether this agent can show permission prompts. When omitted, infer it
+   * from the parent session; specialized unattended callers should pass false. */
   canShowPermissionPrompts?: boolean
   forkContextMessages?: Message[]
   querySource: QuerySource
@@ -288,8 +294,9 @@ export async function* runAgent({
     abortController?: AbortController
     agentId?: AgentId
   }
-  model?: ModelAlias
+  model?: string
   maxTurns?: number
+  maxSteps?: number
   /** Preserve toolUseResult on messages for subagents with viewable transcripts */
   preserveToolUseResults?: boolean
   /** Precomputed tool pool for the worker agent. Computed by the caller
@@ -318,6 +325,10 @@ export async function* runAgent({
   /** Worktree path if the agent was spawned with isolation: "worktree".
    * Persisted to metadata so resume can restore the correct cwd. */
   worktreePath?: string
+  /** Explicit cwd override for the agent's working directory. Persisted for
+   * resume even when a worktree exists, so multi-repo parent sessions can
+   * fall back to the child-repo path after worktree cleanup. */
+  cwd?: string
   /** Original task description from AgentTool input. Persisted to metadata
    * so a resumed agent's notification can show the original description. */
   description?: string
@@ -331,10 +342,37 @@ export async function* runAgent({
   onQueryProgress?: () => void
   /** Agent name (team member name) for routing resolution */
   agentName?: string
+  /** Routing key for per-agent provider resolution. In-process teammates build a
+   *  synthetic agentDefinition whose agentType is the teammate's display name,
+   *  which drops the original subagent_type that agentRouting is keyed on. Pass
+   *  the original subagent_type here so the configured route still resolves. */
+  routingSubagentType?: string
+  /** App/root permission state captured synchronously by an ordinary AgentTool
+   * before delayed or restarted execution can switch the displayed session. */
+  permissionSessionState?: {
+    appState: AppState
+    rootAppState: AppState
+  }
 }): AsyncGenerator<Message, void> {
   // Track subagent usage for feature discovery
 
-  const appState = toolUseContext.getAppState()
+  const initialAppState =
+    permissionSessionState?.appState ?? toolUseContext.getAppState()
+  const getOriginAppState = createPermissionSessionStateGetter(
+    toolUseContext.options.permissionSessionId,
+    initialAppState,
+    toolUseContext.getAppState,
+  )
+  const initialRootAppState =
+    permissionSessionState?.rootAppState ??
+    toolUseContext.getRootAppState?.() ??
+    initialAppState
+  const getOriginRootAppState = createPermissionSessionStateGetter(
+    toolUseContext.options.permissionSessionId,
+    initialRootAppState,
+    () => toolUseContext.getRootAppState?.() ?? toolUseContext.getAppState(),
+  )
+  const appState = getOriginAppState()
   const permissionMode = appState.toolPermissionContext.mode
   // Always-shared channel to the root AppState store. toolUseContext.setAppState
   // is a no-op when the *parent* is itself an async agent (nested async→async),
@@ -350,12 +388,32 @@ export async function* runAgent({
   )
 
   // Resolve per-agent provider routing from settings
-  const providerOverride = resolveAgentProvider(
-    agentName,
-    agentDefinition.agentType,
-    getInitialSettings(),
-  )
-  const effectiveModel = providerOverride ? providerOverride.model : resolvedAgentModel
+  const settings = getInitialSettings()
+
+  const { mainLoopModel: effectiveModel, providerOverride } =
+    resolveAgentRunModelRouting({
+      resolvedAgentModel,
+      parentModel: toolUseContext.options.mainLoopModel,
+      toolSpecifiedModel: model,
+      agentName,
+      subagentType: routingSubagentType ?? agentDefinition.agentType,
+      agentDefinitionModel: agentDefinition.model,
+      settings,
+      permissionMode,
+    })
+
+  if (
+    shouldEnforceModelAllowlist(
+      resolvedAgentModel,
+      effectiveModel,
+      providerOverride !== undefined,
+    ) &&
+    !isModelAllowed(effectiveModel)
+  ) {
+    throw new Error(
+      `Model '${effectiveModel}' is not available. Your organization restricts model selection.`,
+    )
+  }
 
   const agentId = override?.agentId ? override.agentId : createAgentId()
 
@@ -365,11 +423,6 @@ export async function* runAgent({
     setAgentTranscriptSubdir(agentId, transcriptSubdir)
   }
 
-  // Register agent in Perfetto trace for hierarchy visualization
-  if (isPerfettoTracingEnabled()) {
-    const parentId = toolUseContext.agentId ?? getSessionId()
-    registerPerfettoAgent(agentId, agentDefinition.agentType, parentId)
-  }
 
   // Log API calls path for subagents (internal-only)
   if (process.env.USER_TYPE === 'ant') {
@@ -422,18 +475,37 @@ export async function* runAgent({
       ? systemContextNoGit
       : baseSystemContext
 
-  // Override permission mode if agent defines one
-  // However, don't override if parent is in bypassPermissions or acceptEdits mode - those should always take precedence
-  // For async agents, also set shouldAvoidPermissionPrompts since they can't show UI
+  const inheritedCanShowPermissionPrompts =
+    canShowPermissionPrompts ??
+    toolUseContext.options.canShowPermissionPrompts
+  const shouldAvoidAgentPrompts = shouldAvoidAgentPermissionPrompts({
+    isAsync,
+    canShowPermissionPrompts: inheritedCanShowPermissionPrompts,
+    permissionMode: agentDefinition.permissionMode,
+    isNonInteractiveSession: toolUseContext.options.isNonInteractiveSession,
+  })
+  const descendantCanShowPermissionPrompts =
+    canDescendantShowPermissionPrompts({
+      canShowPermissionPrompts: inheritedCanShowPermissionPrompts,
+      permissionMode: agentDefinition.permissionMode,
+      isNonInteractiveSession: toolUseContext.options.isNonInteractiveSession,
+    })
+
+  // Override permission mode if agent defines one.
+  // However, don't override if parent is in bypassPermissions or acceptEdits mode - those should always take precedence.
+  // Async agents in an interactive session share the parent's permission UI;
+  // only truly non-interactive agents must auto-deny unresolved prompts.
   const agentPermissionMode = agentDefinition.permissionMode
   const agentGetAppState = () => {
-    const state = toolUseContext.getAppState()
+    const state = getOriginAppState()
+    const rootState = getOriginRootAppState()
     let toolPermissionContext = state.toolPermissionContext
 
     // Override permission mode if agent defines one (unless parent is bypassPermissions, acceptEdits, or auto)
     if (
       agentPermissionMode &&
       state.toolPermissionContext.mode !== 'bypassPermissions' &&
+      state.toolPermissionContext.mode !== 'fullAccess' &&
       state.toolPermissionContext.mode !== 'acceptEdits' &&
       !(
         feature('TRANSCRIPT_CLASSIFIER') &&
@@ -446,17 +518,17 @@ export async function* runAgent({
       }
     }
 
-    // Set flag to auto-deny prompts for agents that can't show UI
-    // Use explicit canShowPermissionPrompts if provided, otherwise:
-    //   - bubble mode: always show prompts (bubbles to parent terminal)
-    //   - default: !isAsync (sync agents show prompts, async agents don't)
-    const shouldAvoidPrompts =
-      canShowPermissionPrompts !== undefined
-        ? !canShowPermissionPrompts
-        : agentPermissionMode === 'bubble'
-          ? false
-          : isAsync
-    if (shouldAvoidPrompts) {
+    // Use an explicit caller override when present. Bubble mode always forwards
+    // to the parent terminal. Otherwise, async execution is not itself a reason
+    // to deny: in interactive sessions the inherited canUseTool callback owns
+    // the main-session permission queue.
+    if (rootState.toolPermissionContext.mode === 'dontAsk') {
+      toolPermissionContext = {
+        ...toolPermissionContext,
+        mode: 'dontAsk',
+        shouldAvoidPermissionPrompts: true,
+      }
+    } else if (shouldAvoidAgentPrompts) {
       toolPermissionContext = {
         ...toolPermissionContext,
         shouldAvoidPermissionPrompts: true,
@@ -468,7 +540,7 @@ export async function* runAgent({
     // Since these are background agents, waiting is fine — the user should
     // only be interrupted when automated checks can't resolve the permission.
     // This applies to bubble mode (always) and explicit canShowPermissionPrompts.
-    if (isAsync && !shouldAvoidPrompts) {
+    if (isAsync && !shouldAvoidAgentPrompts) {
       toolPermissionContext = {
         ...toolPermissionContext,
         awaitAutomatedChecksBeforeDialog: true,
@@ -497,14 +569,21 @@ export async function* runAgent({
         ? agentDefinition.effort
         : state.effortValue
 
+    const modelStateChanged =
+      state.mainLoopModel !== effectiveModel ||
+      state.mainLoopModelForSession !== effectiveModel
+
     if (
       toolPermissionContext === state.toolPermissionContext &&
-      effortValue === state.effortValue
+      effortValue === state.effortValue &&
+      !modelStateChanged
     ) {
       return state
     }
     return {
       ...state,
+      mainLoopModel: effectiveModel,
+      mainLoopModelForSession: effectiveModel,
       toolPermissionContext,
       effortValue,
     }
@@ -524,7 +603,7 @@ export async function* runAgent({
         await getAgentSystemPrompt(
           agentDefinition,
           toolUseContext,
-          resolvedAgentModel,
+          effectiveModel,
           additionalWorkingDirectories,
           resolvedTools,
         ),
@@ -683,6 +762,11 @@ export async function* runAgent({
       : isAsync
         ? true
         : (toolUseContext.options.isNonInteractiveSession ?? false),
+    // Preserve prompt capability independently from the child execution mode.
+    // Async children are marked non-interactive for query behavior, but their
+    // inherited canUseTool callback can still reach the interactive root.
+    canShowPermissionPrompts: descendantCanShowPermissionPrompts,
+    permissionSessionId: toolUseContext.options.permissionSessionId,
     appendSystemPrompt: toolUseContext.options.appendSystemPrompt,
     tools: allTools,
     commands: [],
@@ -719,6 +803,10 @@ export async function* runAgent({
     readFileState: agentReadFileState,
     abortController: agentAbortController,
     getAppState: agentGetAppState,
+    getRootAppState: getOriginRootAppState,
+    ...(!isAsync && toolUseContext.queryLifecycle
+      ? { queryLifecycle: toolUseContext.queryLifecycle }
+      : {}),
     // Sync agents share these callbacks with parent
     shareSetAppState: !isAsync,
     shareSetResponseLength: true, // Both sync and async contribute to response metrics
@@ -743,23 +831,49 @@ export async function* runAgent({
     })
   }
 
-  // Record initial messages before the query loop starts, plus the agentType
-  // so resume can route correctly when subagent_type is omitted. Both writes
-  // are fire-and-forget — persistence failure shouldn't block the agent.
-  void recordSidechainTranscript(initialMessages, agentId).catch(_err =>
-    logForDebugging(`Failed to record sidechain transcript: ${_err}`),
-  )
-  void writeAgentMetadata(agentId, {
-    agentType: agentDefinition.agentType,
-    ...(worktreePath && { worktreePath }),
-    ...(description && { description }),
-  }).catch(_err => logForDebugging(`Failed to write agent metadata: ${_err}`))
+  // Record agentType and identity metadata so resume can route correctly.
+  // This must be awaited before writing the initial transcript so that any
+  // resume attempt reading the transcript is guaranteed to find the metadata.
+  let metadataWritten = false
+  try {
+    await writeAgentMetadata(agentId, {
+      agentType: agentDefinition.agentType,
+      source: agentDefinition.source,
+      ...(worktreePath && { worktreePath }),
+      // Keep explicit cwd even when a worktree exists so resume can fall back
+      // to the child repo if the worktree is later removed.
+      ...(cwd && { cwd }),
+      ...(description && { description }),
+    })
+    metadataWritten = true
+  } catch (_err) {
+    logForDebugging(`Failed to write agent metadata: ${_err}`)
+  }
 
+  // Record initial messages before the query loop starts.
+  // Fire-and-forget — persistence failure shouldn't block the agent.
+  // Only write the transcript if identity metadata was successfully persisted,
+  // ensuring we never leave a transcript that would resume without its restricted identity.
+  if (metadataWritten) {
+    void recordSidechainTranscript(initialMessages, agentId).catch(_err =>
+      logForDebugging(`Failed to record sidechain transcript: ${_err}`),
+    )
+  } else {
+    logForDebugging('Skipping initial transcript write because identity metadata persistence failed')
+  }
   // Track the last recorded message UUID for parent chain continuity
   let lastRecordedUuid: UUID | null = initialMessages.at(-1)?.uuid ?? null
 
   try {
-    for await (const message of query({
+    let queryTerminal: Terminal | undefined
+    const configuredMaxSteps =
+      Number.isSafeInteger(maxSteps) && maxSteps! > 0
+        ? maxSteps
+        : Number.isSafeInteger(agentDefinition.maxSteps) &&
+            agentDefinition.maxSteps! > 0
+          ? agentDefinition.maxSteps
+          : undefined
+    const queryIterator = query({
       messages: initialMessages,
       systemPrompt: agentSystemPrompt,
       userContext: resolvedUserContext,
@@ -768,55 +882,77 @@ export async function* runAgent({
       toolUseContext: agentToolUseContext,
       querySource,
       maxTurns: maxTurns ?? agentDefinition.maxTurns,
-    })) {
-      onQueryProgress?.()
-      // Forward subagent API request starts to parent's metrics display
-      // so TTFT/OTPS update during subagent execution.
-      if (
-        message.type === 'stream_event' &&
-        message.event.type === 'message_start' &&
-        message.ttftMs != null
-      ) {
-        toolUseContext.pushApiMetricsEntry?.(message.ttftMs)
-        continue
-      }
+      agentStepLimit:
+        configuredMaxSteps !== undefined
+          ? {
+              maxSteps: configuredMaxSteps,
+              agentType: agentDefinition.agentType,
+            }
+          : undefined,
+    })[Symbol.asyncIterator]()
 
-      // Yield attachment messages (e.g., structured_output) without recording them
-      if (message.type === 'attachment') {
-        // Handle max turns reached signal from query.ts
-        if (message.attachment.type === 'max_turns_reached') {
-          logForDebugging(
-            `[Agent
-: $
-{
-  agentDefinition.agentType
-}
-] Reached max turns limit ($
-{
-  message.attachment.maxTurns
-}
-)`,
-          )
+    try {
+      while (true) {
+        const next = await queryIterator.next()
+        if (next.done) {
+          queryTerminal = next.value
           break
         }
-        yield message
-        continue
-      }
 
-      if (isRecordableMessage(message)) {
-        // Record only the new message with correct parent (O(1) per message)
-        await recordSidechainTranscript(
-          [message],
-          agentId,
-          lastRecordedUuid,
-        ).catch(err =>
-          logForDebugging(`Failed to record sidechain transcript: ${err}`),
-        )
-        if (message.type !== 'progress') {
-          lastRecordedUuid = message.uuid
+        const message = next.value
+        onQueryProgress?.()
+        // Forward subagent API request starts to parent's metrics display
+        // so TTFT/OTPS update during subagent execution.
+        if (
+          message.type === 'stream_event' &&
+          message.event.type === 'message_start' &&
+          message.ttftMs != null
+        ) {
+          toolUseContext.pushApiMetricsEntry?.(message.ttftMs)
+          continue
         }
-        yield message
+
+        // Yield attachment messages (e.g., structured_output) without recording them
+        if (message.type === 'attachment') {
+          // Handle max turns reached signal from query.ts
+          if (message.attachment.type === 'max_turns_reached') {
+            logForDebugging(
+              `[Agent: ${agentDefinition.agentType}] Reached max turns limit (${message.attachment.maxTurns})`,
+            )
+            break
+          }
+          yield message
+          continue
+        }
+
+        if (isRecordableMessage(message)) {
+          // Record only the new message with correct parent (O(1) per message)
+          // Only write if identity metadata was successfully persisted.
+          if (metadataWritten) {
+            await recordSidechainTranscript(
+              [message],
+              agentId,
+              lastRecordedUuid,
+            ).catch(err =>
+              logForDebugging(`Failed to record sidechain transcript: ${err}`),
+            )
+          }
+          if (message.type !== 'progress') {
+            lastRecordedUuid = message.uuid
+          }
+          yield message
+        }
       }
+    } finally {
+      if (queryTerminal === undefined) {
+        await queryIterator.return?.(undefined as never)
+      }
+    }
+
+    if (queryTerminal?.reason === 'agent_step_limit') {
+      logForDebugging(
+        `[Agent: ${agentDefinition.agentType}] Stopped after reaching maxSteps (${queryTerminal.stepsUsed}/${queryTerminal.maxSteps})`,
+      )
     }
 
     if (agentAbortController.signal.aborted) {
@@ -842,8 +978,6 @@ export async function* runAgent({
     agentToolUseContext.readFileState.clear()
     // Release the cloned fork context messages
     initialMessages.length = 0
-    // Release perfetto agent registry entry
-    unregisterPerfettoAgent(agentId)
     // Release transcript subdir mapping
     clearAgentTranscriptSubdir(agentId)
     // Release this agent's todos entry. Without this, every subagent that
@@ -920,7 +1054,7 @@ export function filterIncompleteToolCalls(messages: Message[]): Message[] {
 async function getAgentSystemPrompt(
   agentDefinition: AgentDefinition,
   toolUseContext: Pick<ToolUseContext, 'options'>,
-  resolvedAgentModel: string,
+  effectiveModel: string,
   additionalWorkingDirectories: string[],
   resolvedTools: readonly Tool[],
 ): Promise<string[]> {
@@ -931,14 +1065,14 @@ async function getAgentSystemPrompt(
 
     return await enhanceSystemPromptWithEnvDetails(
       prompts,
-      resolvedAgentModel,
+      effectiveModel,
       additionalWorkingDirectories,
       enabledToolNames,
     )
   } catch (_error) {
     return enhanceSystemPromptWithEnvDetails(
       [DEFAULT_AGENT_PROMPT],
-      resolvedAgentModel,
+      effectiveModel,
       additionalWorkingDirectories,
       enabledToolNames,
     )

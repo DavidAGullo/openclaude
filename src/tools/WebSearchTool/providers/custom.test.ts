@@ -1,5 +1,27 @@
 import { describe, expect, test, beforeEach, afterEach } from 'bun:test'
-import { extractHits, customProvider, isPrivateHostname } from './custom.js'
+import {
+  acquireSharedMutationLock,
+  releaseSharedMutationLock,
+} from '../../../test/sharedMutationLock.js'
+import {
+  extractHits,
+  customProvider,
+  isPrivateHostname,
+  readPositiveEnvNumber,
+} from './custom.js'
+
+async function importFreshCustomProvider() {
+  const stamp = `${Date.now()}-${Math.random()}`
+  return import(`./custom.ts?ts=${stamp}`)
+}
+
+beforeEach(async () => {
+  await acquireSharedMutationLock('WebSearchTool/providers/custom.test.ts')
+})
+
+afterEach(() => {
+  releaseSharedMutationLock()
+})
 
 // ---------------------------------------------------------------------------
 // extractHits — flexible response parsing
@@ -174,6 +196,143 @@ describe('buildAuthHeadersForPreset direct assertions', () => {
     const { buildAuthHeadersForPreset } = require('./custom.js')
     expect(buildAuthHeadersForPreset({ urlTemplate: '', queryParam: 'q', authHeader: 'Authorization' })).toEqual({})
   })
+
+  test('preset authScheme="" sends bare token (Brave-style)', () => {
+    process.env.WEB_KEY = 'brv-test-123'
+    delete process.env.WEB_AUTH_HEADER
+    delete process.env.WEB_AUTH_SCHEME
+    const { buildAuthHeadersForPreset } = require('./custom.js')
+    const result = buildAuthHeadersForPreset({
+      urlTemplate: '',
+      queryParam: 'q',
+      authHeader: 'X-Subscription-Token',
+      authScheme: '',
+    })
+    // Bare token, no leading space, no "Bearer" prefix
+    expect(result).toEqual({ 'X-Subscription-Token': 'brv-test-123' })
+  })
+
+  test('preset authQueryParam suppresses auth headers entirely (Google-style)', () => {
+    process.env.WEB_KEY = 'gck-test-123'
+    delete process.env.WEB_AUTH_HEADER
+    const { buildAuthHeadersForPreset } = require('./custom.js')
+    const result = buildAuthHeadersForPreset({
+      urlTemplate: '',
+      queryParam: 'q',
+      authQueryParam: 'key',
+    })
+    expect(result).toEqual({})
+  })
+
+  test('explicit WEB_AUTH_HEADER overrides authQueryParam suppression', () => {
+    process.env.WEB_KEY = 'gck-test-123'
+    process.env.WEB_AUTH_HEADER = 'X-Custom-Auth'
+    const { buildAuthHeadersForPreset } = require('./custom.js')
+    const result = buildAuthHeadersForPreset({
+      urlTemplate: '',
+      queryParam: 'q',
+      authQueryParam: 'key',
+    })
+    // User overrode → still emit the header
+    expect(result).toEqual({ 'X-Custom-Auth': 'Bearer gck-test-123' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Built-in presets — end-to-end request shape (with mocked fetch)
+// ---------------------------------------------------------------------------
+
+describe('built-in preset request shapes', () => {
+  const PRESET_ENV_KEYS = [
+    'WEB_PROVIDER', 'WEB_KEY', 'WEB_AUTH_HEADER', 'WEB_AUTH_SCHEME',
+    'WEB_SEARCH_API', 'WEB_URL_TEMPLATE', 'WEB_PARAMS', 'GOOGLE_CSE_ID',
+  ]
+  const savedEnv: Record<string, string | undefined> = {}
+  const originalFetch = globalThis.fetch
+  const originalConsoleWarn = console.warn
+  let capturedWarnings: unknown[][] = []
+
+  beforeEach(() => {
+    for (const k of PRESET_ENV_KEYS) savedEnv[k] = process.env[k]
+    capturedWarnings = []
+    console.warn = (...args: unknown[]) => {
+      capturedWarnings.push(args)
+    }
+  })
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+    globalThis.fetch = originalFetch
+    console.warn = originalConsoleWarn
+  })
+
+  test('google preset sends ?key= and ?cx= as query params, no auth header', async () => {
+    process.env.WEB_PROVIDER = 'google'
+    process.env.WEB_KEY = 'gck-test-key'
+    process.env.GOOGLE_CSE_ID = 'cse-test-id'
+    delete process.env.WEB_AUTH_HEADER
+
+    let capturedUrl = ''
+    let capturedHeaders: Record<string, string> = {}
+    globalThis.fetch = (async (input: any, init: any) => {
+      capturedUrl = typeof input === 'string' ? input : input.toString()
+      capturedHeaders = (init?.headers ?? {}) as Record<string, string>
+      return new Response(JSON.stringify({ items: [] }), { status: 200 })
+    }) as typeof fetch
+
+    const { customProvider: freshCustomProvider } = await importFreshCustomProvider()
+    await freshCustomProvider.search({ query: 'hello world' })
+
+    expect(capturedUrl).toContain('https://www.googleapis.com/customsearch/v1')
+    expect(capturedUrl).toContain('key=gck-test-key')
+    expect(capturedUrl).toContain('cx=cse-test-id')
+    expect(capturedUrl).toContain('q=hello+world')
+    expect(capturedHeaders.Authorization).toBeUndefined()
+    expect(
+      capturedWarnings.some(call =>
+        String(call[0]).includes('Custom search provider is active'),
+      ),
+    ).toBe(true)
+  })
+
+  test('google preset throws clear error when GOOGLE_CSE_ID is missing', async () => {
+    process.env.WEB_PROVIDER = 'google'
+    process.env.WEB_KEY = 'gck-test-key'
+    delete process.env.GOOGLE_CSE_ID
+
+    const { customProvider } = require('./custom.js')
+    await expect(customProvider.search({ query: 'q' })).rejects.toThrow(/GOOGLE_CSE_ID/)
+  })
+
+  test('google preset throws clear error when WEB_KEY is missing', async () => {
+    process.env.WEB_PROVIDER = 'google'
+    process.env.GOOGLE_CSE_ID = 'cse-test-id'
+    delete process.env.WEB_KEY
+
+    const { customProvider } = require('./custom.js')
+    await expect(customProvider.search({ query: 'q' })).rejects.toThrow(/WEB_KEY/)
+  })
+
+  test('brave preset sends bare token in X-Subscription-Token (no Bearer prefix)', async () => {
+    process.env.WEB_PROVIDER = 'brave'
+    process.env.WEB_KEY = 'brv-test-key'
+    delete process.env.WEB_AUTH_HEADER
+    delete process.env.WEB_AUTH_SCHEME
+
+    let capturedHeaders: Record<string, string> = {}
+    globalThis.fetch = (async (_input: any, init: any) => {
+      capturedHeaders = (init?.headers ?? {}) as Record<string, string>
+      return new Response(JSON.stringify({ web: { results: [] } }), { status: 200 })
+    }) as typeof fetch
+
+    const { customProvider } = require('./custom.js')
+    await customProvider.search({ query: 'q' })
+
+    expect(capturedHeaders['X-Subscription-Token']).toBe('brv-test-key')
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -264,5 +423,35 @@ describe('isPrivateHostname — IPv6', () => {
 
   test('malformed IPv6 is not classified as private (URL parser rejects it upstream)', () => {
     expect(isPrivateHostname('not:an:ipv6')).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// readPositiveEnvNumber — WEB_CUSTOM_TIMEOUT_SEC / WEB_CUSTOM_MAX_BODY_KB
+// ---------------------------------------------------------------------------
+
+describe('readPositiveEnvNumber', () => {
+  test('parses a valid positive override', () => {
+    expect(readPositiveEnvNumber('45', 120)).toBe(45)
+    expect(readPositiveEnvNumber('0.5', 120)).toBe(0.5)
+  })
+
+  test('falls back for missing / empty / non-numeric input', () => {
+    expect(readPositiveEnvNumber(undefined, 120)).toBe(120)
+    expect(readPositiveEnvNumber('', 120)).toBe(120)
+    expect(readPositiveEnvNumber('fast', 120)).toBe(120)
+  })
+
+  test('falls back for zero and negative values instead of passing them through', () => {
+    // The old `Number(x) || DEFAULT` idiom rescued 0 but let negatives past —
+    // a negative timeout aborts every request and a negative body cap makes the
+    // size guard reject every POST.
+    expect(readPositiveEnvNumber('0', 120)).toBe(120)
+    expect(readPositiveEnvNumber('-1', 120)).toBe(120)
+    expect(readPositiveEnvNumber('-9999', 300)).toBe(300)
+  })
+
+  test('falls back for non-finite values (Infinity)', () => {
+    expect(readPositiveEnvNumber('1e999', 120)).toBe(120)
   })
 })

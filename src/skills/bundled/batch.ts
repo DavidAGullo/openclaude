@@ -71,7 +71,7 @@ For each agent, the prompt must be fully self-contained. Include:
 ${WORKER_INSTRUCTIONS}
 \`\`\`
 
-Use \`subagent_type: "general-purpose"\` unless a more specific agent type fits.
+Use a specific custom agent type if one fits the work unit, or \`subagent_type: "general-purpose"\` for default workers. Do NOT omit \`subagent_type\` — batch requires fresh, isolated subprocesses, and omitting the type routes to a fork (which inherits the coordinator's context) when the fork gate is on, which breaks the self-contained worktree invariant.
 
 ## Phase 3: Track Progress
 
@@ -102,8 +102,10 @@ export function registerBatchSkill(): void {
     name: 'batch',
     description:
       'Research and plan a large-scale change, then execute it in parallel across 5–30 isolated worktree agents that each open a PR.',
+    descriptionKey: 'skills.batch.description',
     whenToUse:
       'Use when the user wants to make a sweeping, mechanical change across many files (migrations, refactors, bulk renames) that can be decomposed into independent parallel units.',
+    whenToUseKey: 'skills.batch.whenToUse',
     argumentHint: '<instruction>',
     userInvocable: true,
     disableModelInvocation: true,

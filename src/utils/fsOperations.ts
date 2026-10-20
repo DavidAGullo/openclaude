@@ -1,6 +1,9 @@
 import * as fs from 'fs'
 import {
+  cp as cpPromise,
+  lstat as lstatPromise,
   mkdir as mkdirPromise,
+  mkdtemp as mkdtempPromise,
   open,
   readdir as readdirPromise,
   readFile as readFilePromise,
@@ -9,6 +12,7 @@ import {
   rm as rmPromise,
   stat as statPromise,
   unlink as unlinkPromise,
+  writeFile as writeFilePromise,
 } from 'fs/promises'
 import { homedir } from 'os'
 import * as nodePath from 'path'
@@ -28,6 +32,10 @@ export type FsOperations = {
   existsSync(path: string): boolean
   /** Gets file stats asynchronously */
   stat(path: string): Promise<fs.Stats>
+  /** Gets file stats asynchronously without following symlinks */
+  lstat(path: string): Promise<fs.Stats>
+  /** Rejects unless the process has the given fs.constants access mode on the path */
+  access(path: string, mode?: number): Promise<void>
   /** Lists directory contents with file type information asynchronously */
   readdir(path: string): Promise<fs.Dirent[]>
   /** Deletes file asynchronously */
@@ -41,10 +49,29 @@ export type FsOperations = {
   ): Promise<void>
   /** Creates directory recursively asynchronously. */
   mkdir(path: string, options?: { mode?: number }): Promise<void>
+  /** Creates a unique temporary directory asynchronously. */
+  mkdtemp(prefix: string): Promise<string>
   /** Reads file content as string asynchronously */
   readFile(path: string, options: { encoding: BufferEncoding }): Promise<string>
+  /** Writes file content asynchronously */
+  writeFile(
+    path: string,
+    data: string | Buffer,
+    options?: { encoding?: BufferEncoding },
+  ): Promise<void>
   /** Renames/moves file asynchronously */
   rename(oldPath: string, newPath: string): Promise<void>
+  /** Copies a file or directory tree asynchronously */
+  cp(
+    source: string,
+    destination: string,
+    options?: {
+      recursive?: boolean
+      errorOnExist?: boolean
+      force?: boolean
+      preserveTimestamps?: boolean
+    },
+  ): Promise<void>
   /** Gets file stats */
   statSync(path: string): fs.Stats
   /** Gets file stats without following symlinks */
@@ -72,6 +99,18 @@ export type FsOperations = {
   }
   /** Appends string to file */
   appendFileSync(path: string, data: string, options?: { mode?: number }): void
+  /**
+   * Opens a regular file without following path symlinks and appends data.
+   *
+   * Linux only and requires an absolute path; throws on unsupported platforms
+   * or relative paths. A partial write that cannot be rolled back rejects with
+   * `ERR_DIAGNOSTIC_APPEND_UNCERTAIN`.
+   */
+  appendRegularFile(
+    path: string,
+    data: string,
+    options?: { mode?: number },
+  ): Promise<void>
   /** Copies file from source to destination */
   copyFileSync(src: string, dest: string): void
   /** Deletes file */
@@ -395,6 +434,14 @@ export const NodeFsOperations: FsOperations = {
     return statPromise(fsPath)
   },
 
+  async access(fsPath, mode) {
+    return fs.promises.access(fsPath, mode)
+  },
+
+  async lstat(fsPath) {
+    return lstatPromise(fsPath)
+  },
+
   async readdir(fsPath) {
     return readdirPromise(fsPath, { withFileTypes: true })
   },
@@ -415,21 +462,52 @@ export const NodeFsOperations: FsOperations = {
     try {
       await mkdirPromise(dirPath, { recursive: true, ...options })
     } catch (e) {
+      const code = getErrnoCode(e)
       // Bun/Windows: recursive:true throws EEXIST on directories with the
       // FILE_ATTRIBUTE_READONLY bit set (Group Policy, OneDrive, desktop.ini).
       // Bun's directoryExistsAt misclassifies DIRECTORY+READONLY as not-a-dir
       // (bun-internal src/sys.zig existsAtType). The dir exists; ignore.
       // https://github.com/anthropics/claude-code/issues/30924
-      if (getErrnoCode(e) !== 'EEXIST') throw e
+      if (code === 'EEXIST') return
+      // Permission denied on recursive:true — the parent dir may exist but
+      // refuse writes (e.g. /tmp in container environments with restricted
+      // permissions, systemd private tmp namespaces). If the directory
+      // already exists via a prior mkdir call, treat it as a no-op. This
+      // prevents the error from propagating to callers that don't catch it.
+      // EPERM gets the same treatment: on Windows, mkdir on a drive root
+      // ('D:\') maps the kernel's "cannot create a root that already exists"
+      // to EPERM rather than EEXIST — not an actual permissions failure.
+      // The existsSync guard keeps genuine "cannot create this directory"
+      // failures (dir absent, or dir present but not writable — the
+      // subsequent file write surfaces the real EACCES) propagating.
+      if (
+        (code === 'EACCES' || code === 'EPERM') &&
+        fs.existsSync(dirPath)
+      ) {
+        return
+      }
+      throw e
     }
+  },
+
+  async mkdtemp(prefix) {
+    return mkdtempPromise(prefix)
   },
 
   async readFile(fsPath, options) {
     return readFilePromise(fsPath, { encoding: options.encoding })
   },
 
+  async writeFile(fsPath, data, options) {
+    await writeFilePromise(fsPath, data, options)
+  },
+
   async rename(oldPath, newPath) {
     return renamePromise(oldPath, newPath)
+  },
+
+  async cp(source, destination, options) {
+    return cpPromise(source, destination, options)
   },
 
   statSync(fsPath) {
@@ -486,6 +564,103 @@ export const NodeFsOperations: FsOperations = {
     fs.appendFileSync(path, data)
   },
 
+  async appendRegularFile(path, data, options) {
+    if (process.platform !== 'linux') {
+      throw new Error('Secure diagnostic file output is available on Linux only')
+    }
+    if (!nodePath.isAbsolute(path)) {
+      throw new Error('Secure diagnostic file output requires an absolute path')
+    }
+
+    const resolvedPath = nodePath.resolve(path)
+    const components = nodePath
+      .relative(nodePath.parse(resolvedPath).root, nodePath.dirname(resolvedPath))
+      .split(nodePath.sep)
+      .filter(Boolean)
+    const directoryFlags = fs.constants.O_RDONLY |
+      fs.constants.O_DIRECTORY |
+      fs.constants.O_NOFOLLOW
+    const descriptorDirectory = '/proc/self/fd'
+    let directoryHandle = await open('/', directoryFlags)
+    let committed = false
+    let operationError: unknown
+
+    try {
+      for (const component of components) {
+        const descriptorPath = `${descriptorDirectory}/${directoryHandle.fd}/${component}`
+        let nextDirectoryHandle
+        try {
+          nextDirectoryHandle = await open(descriptorPath, directoryFlags)
+        } catch (error) {
+          if (getErrnoCode(error) !== 'ENOENT') throw error
+          await mkdirPromise(descriptorPath, { mode: 0o700 })
+          nextDirectoryHandle = await open(descriptorPath, directoryFlags)
+        }
+        try {
+          await directoryHandle.close()
+        } catch (error) {
+          await nextDirectoryHandle.close().catch(() => {})
+          throw error
+        }
+        directoryHandle = nextDirectoryHandle
+      }
+
+      const descriptorPath = `${descriptorDirectory}/${directoryHandle.fd}/${nodePath.basename(resolvedPath)}`
+      const flags = fs.constants.O_APPEND |
+      fs.constants.O_CREAT |
+      fs.constants.O_NONBLOCK |
+      fs.constants.O_WRONLY |
+      fs.constants.O_NOFOLLOW
+      const handle = await open(descriptorPath, flags, options?.mode ?? 0o600)
+      let fileOperationError: unknown
+      try {
+        const stats = await handle.stat()
+        if (!stats.isFile()) {
+          throw new Error('Diagnostics target is not a regular file')
+        }
+        if (options?.mode !== undefined) await handle.chmod(options.mode)
+        try {
+          await handle.writeFile(data, { encoding: 'utf8' })
+          committed = true
+        } catch (error) {
+          try {
+            await handle.truncate(stats.size)
+          } catch (rollbackError) {
+            throw Object.assign(
+              new Error('Diagnostic append may have partially committed', {
+                cause: rollbackError,
+              }),
+              { code: 'ERR_DIAGNOSTIC_APPEND_UNCERTAIN' },
+            )
+          }
+          throw error
+        }
+      } catch (error) {
+        fileOperationError = error
+      }
+      try {
+        await handle.close()
+      } catch (error) {
+        // A close failure after writeFile completed cannot safely be interpreted
+        // as a failed append; replaying would duplicate the committed batch.
+        if (!committed && fileOperationError === undefined) {
+          fileOperationError = error
+        }
+      }
+      if (fileOperationError !== undefined) throw fileOperationError
+    } catch (error) {
+      operationError = error
+    }
+    try {
+      await directoryHandle.close()
+    } catch (error) {
+      // Preserve an earlier operation error so a cleanup failure cannot hide an
+      // uncertain commit and cause the caller to replay the same batch.
+      if (!committed && operationError === undefined) operationError = error
+    }
+    if (operationError !== undefined) throw operationError
+  },
+
   copyFileSync(src, dest) {
     using _ = slowLogging`fs.copyFileSync(${src} → ${dest})`
     fs.copyFileSync(src, dest)
@@ -536,12 +711,29 @@ export const NodeFsOperations: FsOperations = {
     try {
       fs.mkdirSync(dirPath, mkdirOptions)
     } catch (e) {
+      const code = getErrnoCode(e)
       // Bun/Windows: recursive:true throws EEXIST on directories with the
       // FILE_ATTRIBUTE_READONLY bit set (Group Policy, OneDrive, desktop.ini).
       // Bun's directoryExistsAt misclassifies DIRECTORY+READONLY as not-a-dir
       // (bun-internal src/sys.zig existsAtType). The dir exists; ignore.
       // https://github.com/anthropics/claude-code/issues/30924
-      if (getErrnoCode(e) !== 'EEXIST') throw e
+      if (code === 'EEXIST') return
+      // Permission denied on recursive:true — the parent dir may exist but
+      // refuse writes (e.g. /tmp in container environments with restricted
+      // permissions, systemd private tmp namespaces). If the directory
+      // already exists via a prior mkdir call, treat it as a no-op.
+      // EPERM gets the same treatment: on Windows, mkdir on a drive root
+      // ('D:\') maps the kernel's "cannot create a root that already exists"
+      // to EPERM rather than EEXIST — not an actual permissions failure.
+      // The existsSync guard keeps genuine "cannot create this directory"
+      // failures propagating.
+      if (
+        (code === 'EACCES' || code === 'EPERM') &&
+        fs.existsSync(dirPath)
+      ) {
+        return
+      }
+      throw e
     }
   },
 

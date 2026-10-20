@@ -1,4 +1,4 @@
-import { saveGlobalConfig } from './config.js'
+import { saveGlobalConfig, type GlobalConfig } from './config.js'
 import { updateSettingsForSource } from './settings/settings.js'
 
 export const STARTUP_PROVIDER_OVERRIDE_ENV_KEYS = [
@@ -12,13 +12,20 @@ export const STARTUP_PROVIDER_OVERRIDE_ENV_KEYS = [
   'OPENAI_BASE_URL',
   'OPENAI_API_BASE',
   'OPENAI_MODEL',
+  'OPENAI_API_KEYS',
   'OPENAI_API_KEY',
+  'LLMTR_API_KEY',
+  'CMD_API_KEY',
+  'COMMANDCODE_API_KEY',
+  'COMMAND_CODE_API_KEY',
   'OPENAI_ORG',
   'OPENAI_PROJECT',
   'OPENAI_ORGANIZATION',
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_MODEL',
   'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_CUSTOM_HEADERS',
   'GEMINI_API_KEY',
   'GOOGLE_API_KEY',
   'GEMINI_BASE_URL',
@@ -37,6 +44,8 @@ export const STARTUP_PROVIDER_OVERRIDE_ENV_KEYS = [
   'MINIMAX_MODEL',
   'NVIDIA_API_KEY',
   'NVIDIA_NIM',
+  'VENICE_API_KEY',
+  'LONGCAT_API_KEY',
 ] as const
 
 type GlobalConfigWithEnv = {
@@ -51,10 +60,17 @@ const DELETE_SETTINGS_ENV_VALUE = undefined as unknown as string
 
 export function clearStartupProviderOverrides(options?: {
   updateUserSettings?: typeof updateSettingsForSource
-  saveConfig?: typeof saveGlobalConfig
+  saveConfig?: (
+    updater: (current: GlobalConfigWithEnv) => GlobalConfigWithEnv,
+  ) => unknown
 }): string | null {
   const updateUserSettings = options?.updateUserSettings ?? updateSettingsForSource
-  const saveConfig = options?.saveConfig ?? saveGlobalConfig
+  const saveConfig =
+    options?.saveConfig ??
+    ((updater: (current: GlobalConfigWithEnv) => GlobalConfigWithEnv) =>
+      saveGlobalConfig(
+        updater as unknown as (currentConfig: GlobalConfig) => GlobalConfig,
+      ))
   const envPatch = Object.fromEntries(
     STARTUP_PROVIDER_OVERRIDE_ENV_KEYS.map(key => [
       key,

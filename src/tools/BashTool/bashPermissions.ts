@@ -1,7 +1,6 @@
 import { feature } from 'bun:bundle'
 import { APIUserAbortError } from '@anthropic-ai/sdk'
 import type { z } from 'zod/v4'
-import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
@@ -12,8 +11,6 @@ import { count } from '../../utils/array.js'
 import {
   checkSemantics,
   nodeTypeId,
-  type ParseForSecurityResult,
-  parseForSecurityFromAst,
   type Redirect,
   type SimpleCommand,
 } from '../../utils/bash/ast.js'
@@ -23,7 +20,6 @@ import {
   getCommandSubcommandPrefix,
   splitCommand_DEPRECATED,
 } from '../../utils/bash/commands.js'
-import { parseCommandRaw } from '../../utils/bash/parser.js'
 import { tryParseShellCommand } from '../../utils/bash/shellQuote.js'
 import { getCwd } from '../../utils/cwd.js'
 import { logForDebugging } from '../../utils/debug.js'
@@ -68,9 +64,16 @@ import { SandboxManager } from '../../utils/sandbox/sandbox-adapter.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { windowsPathToPosixPath } from '../../utils/windowsPaths.js'
 import { BashTool } from './BashTool.js'
+import {
+  analyzeBashCommand,
+  type BashCommandAnalysis,
+  type LegacyShellParseAnalysis,
+  logLegacyParserLimitationOnce,
+} from './bashCommandAnalysis.js'
 import { checkCommandOperatorPermissions } from './bashCommandHelpers.js'
 import {
   bashCommandIsSafeAsync_DEPRECATED,
+  checkBashCommitMessagePolicy,
   stripSafeHeredocSubstitutions,
 } from './bashSecurity.js'
 import { checkPermissionMode } from './modeValidation.js'
@@ -733,8 +736,14 @@ export function stripAllLeadingEnvVars(
   // dangerous forms like $(cmd), ${var}, and $((expr)). This means
   // FOO=$VAR is not stripped — adding $VAR matching creates ReDoS risk
   // (CodeQL #671) and $VAR bypasses are low-priority.
+  //
+  // SECURITY: Array subscript uses [^\]$`{(]* (not [^\]]*) to block command
+  // substitution in subscript position. Bash executes FOO[$(cmd)]=val as a
+  // side effect during assignment parsing; if the pattern matched $(cmd) in
+  // the subscript, the env-var prefix would be stripped while the substitution
+  // silently executed — bypassing deny rules that block the substituted command.
   const ENV_VAR_PATTERN =
-    /^([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?)\+?=(?:'[^'\n\r]*'|"(?:\\.|[^"$`\\\n\r])*"|\\.|[^ \t\n\r$`;|&()<>\\\\'"])*[ \t]+/
+    /^([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]$`{(]*\])?)\+?=(?:'[^'\n\r]*'|"(?:\\.|[^"$`\\\n\r])*"|\\.|[^ \t\n\r$`;|&()<>\\\\'"])*[ \t]+/
 
   let stripped = command
   let previousStripped = ''
@@ -1029,6 +1038,7 @@ export const bashToolCheckPermission = (
   toolPermissionContext: ToolPermissionContext,
   compoundCommandHasCd?: boolean,
   astCommand?: SimpleCommand,
+  analysis?: BashCommandAnalysis,
 ): PermissionResult => {
   const command = input.command.trim()
 
@@ -1093,6 +1103,7 @@ export const bashToolCheckPermission = (
     compoundCommandHasCd,
     astCommand?.redirects,
     astCommand ? [astCommand] : undefined,
+    astCommand ? undefined : analysis,
   )
   if (pathResult.behavior !== 'passthrough') {
     return pathResult
@@ -1122,7 +1133,11 @@ export const bashToolCheckPermission = (
   }
 
   // 6. Check for mode-specific permission handling
-  const modeResult = checkPermissionMode(input, toolPermissionContext)
+  const modeResult = checkPermissionMode(
+    input,
+    toolPermissionContext,
+    analysis?.legacyParse,
+  )
   if (modeResult.behavior !== 'passthrough') {
     return modeResult
   }
@@ -1244,9 +1259,10 @@ export async function checkCommandAndSuggestRules(
  *   - allow if no explicit rules (sandbox auto-allow applies)
  *   - passthrough should not occur since we're in auto-allow mode
  */
-function checkSandboxAutoAllow(
+export function checkSandboxAutoAllow(
   input: z.infer<typeof BashTool.inputSchema>,
   toolPermissionContext: ToolPermissionContext,
+  astSubcommands: string[] | null = null,
 ): PermissionResult {
   const command = input.command.trim()
 
@@ -1278,6 +1294,32 @@ function checkSandboxAutoAllow(
   // would return 'ask' before a prefix deny rule on a subcommand (e.g., Bash(rm:*))
   // gets checked, downgrading a deny to an ask.
   const subcommands = splitCommand(command)
+
+  // CC-643: Mirror the legacy-only cap applied in `bashToolHasPermission` (see
+  // the `astSubcommands === null && subcommands.length > MAX...` branch). The
+  // fanout/ReDoS risk is specific to the legacy `splitCommand` path; when
+  // tree-sitter parsed the command cleanly (`astSubcommands !== null`), the
+  // subcommand count is already bounded by structural parse and a long
+  // AST-validated chain (e.g. many `echo`s) is intended to flow through.
+  if (
+    astSubcommands === null &&
+    subcommands.length > MAX_SUBCOMMANDS_FOR_SECURITY_CHECK
+  ) {
+    logForDebugging(
+      `bashPermissions(sandboxAutoAllow): ${subcommands.length} subcommands exceeds cap (${MAX_SUBCOMMANDS_FOR_SECURITY_CHECK}) — returning ask`,
+      { level: 'debug' },
+    )
+    const decisionReason = {
+      type: 'other' as const,
+      reason: `Command splits into ${subcommands.length} subcommands, too many to safety-check individually`,
+    }
+    return {
+      behavior: 'ask',
+      message: createPermissionRequestMessage(BashTool.name, decisionReason),
+      decisionReason,
+    }
+  }
+
   if (subcommands.length > 1) {
     let firstAskRule: PermissionRule | undefined
     for (const sub of subcommands) {
@@ -1443,7 +1485,11 @@ function buildPendingClassifierCheck(
   // Skip in auto mode - auto mode classifier handles all permission decisions
   if (feature('TRANSCRIPT_CLASSIFIER') && toolPermissionContext.mode === 'auto')
     return undefined
-  if (toolPermissionContext.mode === 'bypassPermissions') return undefined
+  if (
+    toolPermissionContext.mode === 'bypassPermissions' ||
+    toolPermissionContext.mode === 'fullAccess'
+  )
+    return undefined
 
   const allowDescriptions = getBashPromptAllowDescriptions(
     toolPermissionContext,
@@ -1457,7 +1503,22 @@ function buildPendingClassifierCheck(
   }
 }
 
+/** Maximum number of speculative classifier results to cache. */
+const MAX_SPECULATIVE_CHECKS_SIZE = 1000
 const speculativeChecks = new Map<string, Promise<ClassifierResult>>()
+
+/**
+ * Remove the oldest entries from speculativeChecks until the map is within
+ * the MAX_SPECULATIVE_CHECKS_SIZE cap. Eviction is FIFO based on insertion
+ * order (Map preserves insertion order for keys).
+ */
+function evictSpeculativeChecks(): void {
+  while (speculativeChecks.size > MAX_SPECULATIVE_CHECKS_SIZE) {
+    const oldestKey = speculativeChecks.keys().next().value
+    if (oldestKey === undefined) break
+    speculativeChecks.delete(oldestKey)
+  }
+}
 
 /**
  * Start a speculative bash allow classifier check early, so it runs in
@@ -1481,7 +1542,11 @@ export function startSpeculativeClassifierCheck(
   if (!isClassifierPermissionsEnabled()) return false
   if (feature('TRANSCRIPT_CLASSIFIER') && toolPermissionContext.mode === 'auto')
     return false
-  if (toolPermissionContext.mode === 'bypassPermissions') return false
+  if (
+    toolPermissionContext.mode === 'bypassPermissions' ||
+    toolPermissionContext.mode === 'fullAccess'
+  )
+    return false
   const allowDescriptions = getBashPromptAllowDescriptions(
     toolPermissionContext,
   )
@@ -1500,6 +1565,7 @@ export function startSpeculativeClassifierCheck(
   // The original promise (which may reject) is still stored in the Map for consumers to await.
   promise.catch(() => {})
   speculativeChecks.set(command, promise)
+  evictSpeculativeChecks()
   return true
 }
 
@@ -1519,6 +1585,13 @@ export function consumeSpeculativeClassifierCheck(
 
 export function clearSpeculativeChecks(): void {
   speculativeChecks.clear()
+}
+
+// Test-only surface for speculative cache eviction assertions.
+export const _test = {
+  speculativeChecks,
+  evictSpeculativeChecks,
+  MAX_SPECULATIVE_CHECKS_SIZE,
 }
 
 /**
@@ -1644,76 +1717,38 @@ export async function bashToolHasPermission(
 ): Promise<PermissionResult> {
   let appState = context.getAppState()
 
-  // 0. AST-based security parse. This replaces both tryParseShellCommand
-  // (the shell-quote pre-check) and the bashCommandIsSafe misparsing gate.
-  // tree-sitter produces either a clean SimpleCommand[] (quotes resolved,
-  // no hidden substitutions) or 'too-complex' — which is exactly the signal
-  // we need to decide whether splitCommand's output can be trusted.
-  //
-  // When tree-sitter WASM is unavailable OR the injection check is disabled
-  // via env var, we fall back to the old path (legacy gate at ~1370 runs).
-  const injectionCheckDisabled = isEnvTruthy(
-    process.env.CLAUDE_CODE_DISABLE_COMMAND_INJECTION_CHECK,
-  )
-  // GrowthBook killswitch for shadow mode — when off, skip the native parse
-  // entirely. Computed once; feature() must stay inline in the ternary below.
-  const shadowEnabled = feature('TREE_SITTER_BASH_SHADOW')
-    ? getFeatureValue_CACHED_MAY_BE_STALE('tengu_birch_trellis', true)
-    : false
-  // Parse once here; the resulting AST feeds both parseForSecurityFromAst
-  // and bashToolCheckCommandOperatorPermissions.
-  let astRoot = injectionCheckDisabled
-    ? null
-    : feature('TREE_SITTER_BASH_SHADOW') && !shadowEnabled
-      ? null
-      : await parseCommandRaw(input.command)
-  let astResult: ParseForSecurityResult = astRoot
-    ? parseForSecurityFromAst(input.command, astRoot)
-    : { kind: 'parse-unavailable' }
-  let astSubcommands: string[] | null = null
-  let astRedirects: Redirect[] | undefined
-  let astCommands: SimpleCommand[] | undefined
-  let shadowLegacySubs: string[] | undefined
-
-  // Shadow-test tree-sitter: record its verdict, then force parse-unavailable
-  // so the legacy path stays authoritative. parseCommand stays gated on
-  // TREE_SITTER_BASH (not SHADOW) so legacy internals remain pure regex.
-  // One event per bash call captures both divergence AND unavailability
-  // reasons; module-load failures are separately covered by the
-  // session-scoped tengu_tree_sitter_load event.
-  if (feature('TREE_SITTER_BASH_SHADOW')) {
-    const available = astResult.kind !== 'parse-unavailable'
-    let tooComplex = false
-    let semanticFail = false
-    let subsDiffer = false
-    if (available) {
-      tooComplex = astResult.kind === 'too-complex'
-      semanticFail =
-        astResult.kind === 'simple' && !checkSemantics(astResult.commands).ok
-      const tsSubs =
-        astResult.kind === 'simple'
-          ? astResult.commands.map(c => c.text)
-          : undefined
-      const legacySubs = splitCommand(input.command)
-      shadowLegacySubs = legacySubs
-      subsDiffer =
-        tsSubs !== undefined &&
-        (tsSubs.length !== legacySubs.length ||
-          tsSubs.some((s, i) => s !== legacySubs[i]))
+  const commitPolicyResult = checkBashCommitMessagePolicy(input.command)
+  if (commitPolicyResult) {
+    if (
+      commitPolicyResult.behavior !== 'ask' &&
+      commitPolicyResult.behavior !== 'deny'
+    ) {
+      return commitPolicyResult
     }
-    logEvent('tengu_tree_sitter_shadow', {
-      available,
-      astTooComplex: tooComplex,
-      astSemanticFail: semanticFail,
-      subsDiffer,
-      injectionCheckDisabled,
-      killswitchOff: !shadowEnabled,
-      cmdOverLength: input.command.length > 10000,
-    })
-    // Always force legacy — shadow mode is observational only.
-    astResult = { kind: 'parse-unavailable' }
-    astRoot = null
+    return {
+      ...commitPolicyResult,
+      message: createPermissionRequestMessage(
+        BashTool.name,
+        commitPolicyResult.decisionReason ?? {
+          type: 'other',
+          reason: 'Git commit policy violation',
+        },
+      ),
+    }
   }
+
+  // 0. Analyze command structure once for this permission check. The helper
+  // keeps AST parsing, shadow telemetry, and legacy shell-quote fallback state
+  // together so parser limitations are classified once per tool use.
+  const analysis = await analyzeBashCommand(input.command)
+  const {
+    astRoot,
+    astResult,
+    astSubcommands,
+    astRedirects,
+    astCommands,
+    shadowLegacySubs,
+  } = analysis
 
   if (astResult.kind === 'too-complex') {
     // Parse succeeded but found structure we can't statically analyze
@@ -1769,17 +1804,8 @@ export async function bashToolHasPermission(
         suggestions: [],
       }
     }
-    // Stash the tokenized subcommands for use below. Downstream code (rule
-    // matching, path extraction, cd detection) still operates on strings, so
-    // we pass the original source span for each SimpleCommand. Downstream
-    // processing (stripSafeWrappers, parseCommandArguments) re-tokenizes
-    // these spans — that re-tokenization has known bugs (stripCommentLines
-    // mishandles newlines inside quotes), but checkSemantics already caught
-    // any argv element containing a newline, so those bugs can't bite here.
-    // Migrating downstream to operate on argv directly is a later commit.
-    astSubcommands = astResult.commands.map(c => c.text)
-    astRedirects = astResult.commands.flatMap(c => c.redirects)
-    astCommands = astResult.commands
+    // AST-derived subcommands, redirects, and argv are provided by
+    // analyzeBashCommand and reused below.
   }
 
   // Legacy shell-quote pre-check. Only reached on 'parse-unavailable'
@@ -1789,8 +1815,14 @@ export async function bashToolHasPermission(
     logForDebugging(
       'bashToolHasPermission: tree-sitter unavailable, using legacy shell-quote path',
     )
-    const parseResult = tryParseShellCommand(input.command)
-    if (!parseResult.success) {
+    const parseResult = analysis.legacyParse
+    if (parseResult.kind === 'failed') {
+      logLegacyParserLimitationOnce(analysis)
+      const earlyExit = checkEarlyExitDeny(
+        input,
+        appState.toolPermissionContext,
+      )
+      if (earlyExit?.behavior === 'deny') return earlyExit
       const decisionReason = {
         type: 'other' as const,
         reason: `Command contains malformed syntax that cannot be parsed: ${parseResult.error}`,
@@ -1808,11 +1840,12 @@ export async function bashToolHasPermission(
   if (
     SandboxManager.isSandboxingEnabled() &&
     SandboxManager.isAutoAllowBashIfSandboxedEnabled() &&
-    shouldUseSandbox(input)
+    shouldUseSandbox(input, analysis)
   ) {
     const sandboxAutoAllowResult = checkSandboxAutoAllow(
       input,
       appState.toolPermissionContext,
+      astSubcommands,
     )
     if (
       sandboxAutoAllowResult.behavior === 'deny' ||
@@ -2026,9 +2059,10 @@ export async function bashToolHasPermission(
         input,
         getCwd(),
         appState.toolPermissionContext,
-        commandHasAnyCd(input.command),
+        commandHasAnyCd(input.command, analysis.legacyParse),
         astRedirects,
         astCommands,
+        analysis,
       )
       if (pathResult.behavior !== 'passthrough') {
         return pathResult
@@ -2136,6 +2170,29 @@ export async function bashToolHasPermission(
     cwdMingw,
   )
 
+  for (const subcommand of subcommands) {
+    const subcommandCommitPolicyResult =
+      checkBashCommitMessagePolicy(subcommand)
+    if (subcommandCommitPolicyResult) {
+      if (
+        subcommandCommitPolicyResult.behavior !== 'ask' &&
+        subcommandCommitPolicyResult.behavior !== 'deny'
+      ) {
+        return subcommandCommitPolicyResult
+      }
+      return {
+        ...subcommandCommitPolicyResult,
+        message: createPermissionRequestMessage(
+          BashTool.name,
+          subcommandCommitPolicyResult.decisionReason ?? {
+            type: 'other',
+            reason: 'Git commit policy violation',
+          },
+        ),
+      }
+    }
+  }
+
   // CC-643: Cap subcommand fanout. Only the legacy splitCommand path can
   // explode — the AST path returns a bounded list (astSubcommands !== null)
   // or short-circuits to 'too-complex' for structures it can't represent.
@@ -2222,6 +2279,7 @@ export async function bashToolHasPermission(
       appState.toolPermissionContext,
       compoundCommandHasCd,
       astCommandsByIdx[i],
+      subcommands.length === 1 ? analysis : undefined,
     ),
   )
 
@@ -2260,6 +2318,7 @@ export async function bashToolHasPermission(
     compoundCommandHasCd,
     astRedirects,
     astCommands,
+    analysis,
   )
   if (pathResult.behavior === 'deny') {
     return pathResult
@@ -2594,7 +2653,14 @@ export function isNormalizedCdCommand(command: string): boolean {
  * Checks if a compound command contains any cd command,
  * using normalized detection that handles env var prefixes and shell quotes.
  */
-export function commandHasAnyCd(command: string): boolean {
+export function commandHasAnyCd(
+  command: string,
+  legacyParse?: LegacyShellParseAnalysis,
+): boolean {
+  if (legacyParse?.kind === 'failed') {
+    return true
+  }
+
   return splitCommand(command).some(subcmd =>
     isNormalizedCdCommand(subcmd.trim()),
   )

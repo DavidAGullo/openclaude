@@ -7,6 +7,7 @@ import {
 } from './config.js'
 import type {
   ConfigScope,
+  McpStdioServerConfig,
   ScopedMcpServerConfig,
 } from './types.js'
 import { describeMcpConfigFilePath, getProjectMcpServerStatus } from './utils.js'
@@ -211,8 +212,14 @@ function getConfigSignature(config: ScopedMcpServerConfig): string {
       return `${config.scope}:${config.type}:${config.url}`
     case 'sdk':
       return `${config.scope}:${config.type}:${config.name}`
-    default:
-      return `${config.scope}:${config.type ?? 'stdio'}:${config.command}:${JSON.stringify(config.args ?? [])}`
+    default: {
+      // 'sse-ide' / 'ws-ide' configs also land here; they carry no
+      // command/args, so read them as optional stdio fields.
+      const { command, args } = config as Partial<
+        Pick<McpStdioServerConfig, 'command' | 'args'>
+      >
+      return `${config.scope}:${config.type ?? 'stdio'}:${command}:${JSON.stringify(args ?? [])}`
+    }
   }
 }
 
@@ -233,7 +240,10 @@ function buildScopeDefinitions(
   activeConfig: ScopedMcpServerConfig | undefined,
   deps: McpDoctorDependencies,
 ): McpDoctorDefinition[] {
-  const config = servers[name]
+  // Own-property lookup: these maps are plain objects from JSON config, so a
+  // bare servers[name] resolves inherited Object.prototype members and would
+  // fabricate a definition for a name like 'constructor'.
+  const config = Object.hasOwn(servers, name) ? servers[name] : undefined
   if (!config) {
     return []
   }
@@ -460,6 +470,7 @@ async function getLiveCheck(
           error: connection.error,
         }
     }
+    return { attempted: true, result: 'failed', durationMs }
   } finally {
     await deps.clearServerCache(name, activeConfig).catch(() => {
       // Best-effort cleanup for diagnostic connections.
@@ -532,7 +543,9 @@ async function buildServerReport(
   }
   const { servers: activeServers } = await deps.getAllMcpConfigs()
   const serverDisabled = deps.isMcpServerDisabled(name)
-  const runtimeConfig = activeServers[name] ?? undefined
+  const runtimeConfig = Object.hasOwn(activeServers, name)
+    ? activeServers[name]
+    : undefined
   const activeConfig = serverDisabled ? undefined : runtimeConfig
 
   const definitions = [
@@ -571,13 +584,23 @@ async function buildServerReport(
       ? activeConfig
       : undefined
 
+  const nameValidationFindings = validationFindingsByName.get(name) ?? []
   const findings: McpDoctorFinding[] = [
-    ...(validationFindingsByName.get(name) ?? []),
+    ...nameValidationFindings,
     ...buildShadowingFindings(definitions),
     ...buildStateFindings(definitions),
   ]
 
-  if (definitions.length === 0 && !shouldAddObservedDefinition) {
+  // A reserved-name target (`__proto__`/`constructor`) never survives parsing,
+  // so it has no definition -- but its fatal validation finding already names
+  // the problem. Adding `state.not_found` on top would report two blocking
+  // findings with contradictory messages, so skip it when validation already
+  // explains this name.
+  if (
+    definitions.length === 0 &&
+    !shouldAddObservedDefinition &&
+    nameValidationFindings.length === 0
+  ) {
     findings.push({
       blocking: true,
       code: 'state.not_found',
@@ -658,8 +681,19 @@ export async function doctorAllServers(
     ),
   )
 
+  // Validation findings are keyed by server name, but a fatal reserved-name
+  // error ("__proto__"/"constructor") is keyed by a name that never survives
+  // parsing, so it is absent from `names` and its finding would otherwise be
+  // built into no server report and silently dropped -- `mcp doctor
+  // --config-only` would read clean while the invalid config is present.
+  // Surface any finding whose server has no report as a global finding.
+  const reportedNames = new Set(names)
+  const orphanedFindings = Array.from(serverFindingsByName.entries())
+    .filter(([name]) => !reportedNames.has(name))
+    .flatMap(([, findings]) => findings)
+
   report.servers = servers
-  report.findings = globalFindings
+  report.findings = [...globalFindings, ...orphanedFindings]
   return summarizeReport(report)
 }
 
@@ -690,6 +724,14 @@ export async function doctorServer(
     deps,
   )
   report.servers = [server]
-  report.findings = globalFindings
+  // Mirror the orphan fold in doctorAllServers: a fatal reserved-name finding is
+  // keyed by a name that never survives parsing, so unless it happens to be the
+  // requested target it is built into no report. Promote any finding for a name
+  // other than the one reported so a poisoned sibling scope is not hidden --
+  // e.g. `mcp doctor realserver` while `.mcp.json` still carries `__proto__`.
+  const orphanedFindings = Array.from(serverFindingsByName.entries())
+    .filter(([findingName]) => findingName !== name)
+    .flatMap(([, findings]) => findings)
+  report.findings = [...globalFindings, ...orphanedFindings]
   return summarizeReport(report)
 }

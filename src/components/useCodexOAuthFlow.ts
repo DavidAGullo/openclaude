@@ -2,6 +2,7 @@ import * as React from 'react'
 
 import {
   CodexOAuthService,
+  type CodexManualCallbackResult,
   type CodexOAuthTokens,
 } from '../services/api/codexOAuth.js'
 import { openBrowser } from '../utils/browser.js'
@@ -14,6 +15,7 @@ export type CodexOAuthFlowStatus =
       state: 'waiting'
       authUrl: string
       browserOpened: boolean | null
+      submitManualCallback: (input: string) => CodexManualCallbackResult
     }
   | {
       state: 'error'
@@ -22,22 +24,21 @@ export type CodexOAuthFlowStatus =
 
 type PersistCodexOAuthCredentials = (options?: {
   profileId?: string
-}) => void
+}) => { warning?: string }
+
+type CodexOAuthServiceLike = Pick<
+  CodexOAuthService,
+  'startOAuthFlow' | 'cleanup' | 'submitManualCallback'
+>
 
 type CodexOAuthFlowDependencies = {
-  createOAuthService?: () => Pick<
-    CodexOAuthService,
-    'startOAuthFlow' | 'cleanup'
-  >
+  createOAuthService?: () => CodexOAuthServiceLike
   openBrowser?: typeof openBrowser
   saveCodexCredentials?: typeof saveCodexCredentials
   isBareMode?: typeof isBareMode
 }
 
-function createDefaultOAuthService(): Pick<
-  CodexOAuthService,
-  'startOAuthFlow' | 'cleanup'
-> {
+function createDefaultOAuthService(): CodexOAuthServiceLike {
   return new CodexOAuthService()
 }
 
@@ -71,6 +72,9 @@ export function useCodexOAuthFlow(options: {
 
     let cancelled = false
     const oauthService = createOAuthService()
+    const submitManualCallback = (
+      input: string,
+    ): CodexManualCallbackResult => oauthService.submitManualCallback(input)
 
     void oauthService
       .startOAuthFlow(async authUrl => {
@@ -79,6 +83,7 @@ export function useCodexOAuthFlow(options: {
           state: 'waiting',
           authUrl,
           browserOpened: null,
+          submitManualCallback,
         })
         const browserOpened = await openBrowserFn(authUrl)
         if (cancelled) return
@@ -86,6 +91,7 @@ export function useCodexOAuthFlow(options: {
           state: 'waiting',
           authUrl,
           browserOpened,
+          submitManualCallback,
         })
       })
       .then(async tokens => {
@@ -106,6 +112,7 @@ export function useCodexOAuthFlow(options: {
                 'Codex OAuth succeeded, but credentials could not be saved securely.',
             )
           }
+          return { warning: saved.warning }
         }
 
         await onAuthenticated(tokens, persistCredentials)

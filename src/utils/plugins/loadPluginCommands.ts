@@ -8,7 +8,7 @@ import {
   substituteArguments,
 } from '../argumentSubstitution.js'
 import { logForDebugging } from '../debug.js'
-import { EFFORT_LEVELS, parseEffortValue } from '../effort.js'
+import { EFFORT_LEVELS, parseFrontmatterEffortValue } from '../effort.js'
 import { isBareMode } from '../envUtils.js'
 import { isENOENT } from '../errors.js'
 import {
@@ -25,7 +25,10 @@ import {
 } from '../markdownConfigLoader.js'
 import { parseUserSpecifiedModel } from '../model/model.js'
 import { executeShellCommandsInPrompt } from '../promptShellExecution.js'
-import { loadAllPluginsCacheOnly } from './pluginLoader.js'
+import {
+  loadAllPluginsCacheOnly,
+  resolveExistingPluginComponentPath,
+} from './pluginLoader.js'
 import {
   loadPluginOptions,
   substitutePluginVariables,
@@ -278,10 +281,12 @@ function createPluginCommand(
 
     const effortRaw = frontmatter['effort']
     const effort =
-      effortRaw !== undefined ? parseEffortValue(effortRaw) : undefined
+      effortRaw !== undefined ? parseFrontmatterEffortValue(effortRaw) : undefined
     if (effortRaw !== undefined && effort === undefined) {
       logForDebugging(
-        `Plugin command ${commandName} has invalid effort '${effortRaw}'. Valid options: ${EFFORT_LEVELS.join(', ')} or an integer`,
+        String(effortRaw).toLowerCase() === 'ultracode'
+          ? `Plugin command ${commandName} requested effort 'ultracode', a session-only mode not supported in frontmatter; ignoring.`
+          : `Plugin command ${commandName} has invalid effort '${effortRaw}'. Valid options: ${EFFORT_LEVELS.filter(l => l !== 'ultracode').join(', ')} or an integer`,
       )
     }
 
@@ -522,7 +527,7 @@ export const getPluginCommands = memoize(async (): Promise<Command[]> => {
                   // Convert metadata.source (relative to plugin root) to absolute path for comparison
                   for (const [name, metadata] of Object.entries(
                     plugin.commandsMetadata,
-                  )) {
+                  ) as [string, CommandMetadata][]) {
                     if (metadata.source) {
                       const fullMetadataPath = join(
                         plugin.path,
@@ -607,7 +612,7 @@ export const getPluginCommands = memoize(async (): Promise<Command[]> => {
       if (plugin.commandsMetadata) {
         for (const [name, metadata] of Object.entries(
           plugin.commandsMetadata,
-        )) {
+        ) as [string, CommandMetadata][]) {
           // Only process entries with inline content (no source)
           if (metadata.content && !metadata.source) {
             try {
@@ -684,6 +689,30 @@ export function clearPluginCommandCache(): void {
  * Loads skills from plugin skills directories
  * Skills are directories containing SKILL.md files
  */
+async function validatePluginSkillFilePath(
+  pluginPath: string,
+  skillFilePath: string,
+): Promise<boolean> {
+  const resolved = await resolveExistingPluginComponentPath(
+    pluginPath,
+    skillFilePath,
+  )
+
+  if (!resolved.exists) {
+    return false
+  }
+
+  if (resolved.outOfBounds) {
+    logForDebugging(
+      `Skipping skill file ${skillFilePath}: resolves outside plugin directory ${pluginPath}`,
+      { level: 'warn' },
+    )
+    return false
+  }
+
+  return true
+}
+
 async function loadSkillsFromDirectory(
   skillsPath: string,
   pluginName: string,
@@ -699,9 +728,11 @@ async function loadSkillsFromDirectory(
   const directSkillPath = join(skillsPath, 'SKILL.md')
   let directSkillContent: string | null = null
   try {
-    directSkillContent = await fs.readFile(directSkillPath, {
-      encoding: 'utf-8',
-    })
+    if (await validatePluginSkillFilePath(pluginPath, directSkillPath)) {
+      directSkillContent = await fs.readFile(directSkillPath, {
+        encoding: 'utf-8',
+      })
+    }
   } catch (e: unknown) {
     if (!isENOENT(e)) {
       logForDebugging(`Failed to load skill from ${directSkillPath}: ${e}`, {
@@ -780,9 +811,12 @@ async function loadSkillsFromDirectory(
       const skillDirPath = join(skillsPath, entry.name)
       const skillFilePath = join(skillDirPath, 'SKILL.md')
 
-      // Try to read SKILL.md directly; skip if it doesn't exist
+      // Try to read SKILL.md directly; skip if it doesn't exist or escapes the plugin root
       let content: string
       try {
+        if (!(await validatePluginSkillFilePath(pluginPath, skillFilePath))) {
+          return
+        }
         content = await fs.readFile(skillFilePath, { encoding: 'utf-8' })
       } catch (e: unknown) {
         if (!isENOENT(e)) {

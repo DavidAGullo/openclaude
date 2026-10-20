@@ -1,10 +1,12 @@
 import type { ZodError } from 'zod/v4'
-import { AbortError, ShellError } from './errors.js'
+import { isAbortError, ShellError } from './errors.js'
 import { INTERRUPT_MESSAGE_FOR_TOOL_USE } from './messages.js'
 
 export function formatError(error: unknown): string {
-  if (error instanceof AbortError) {
-    return error.message || INTERRUPT_MESSAGE_FOR_TOOL_USE
+  if (isAbortError(error)) {
+    return error instanceof Error && error.message
+      ? error.message
+      : INTERRUPT_MESSAGE_FOR_TOOL_USE
   }
   if (!(error instanceof Error)) {
     return String(error)
@@ -12,20 +14,24 @@ export function formatError(error: unknown): string {
   const parts = getErrorParts(error)
   const fullMessage =
     parts.filter(Boolean).join('\n').trim() || 'Command failed with no output'
-  if (fullMessage.length <= 10000) {
+  // 40KB limit — enough for most command error logs (systemctl, apt, python, etc.)
+  const maxErrorLength = 40000
+  if (fullMessage.length <= maxErrorLength) {
     return fullMessage
   }
-  const halfLength = 5000
+  const halfLength = Math.floor(maxErrorLength / 2)
   const start = fullMessage.slice(0, halfLength)
   const end = fullMessage.slice(-halfLength)
-  return `${start}\n\n... [${fullMessage.length - 10000} characters truncated] ...\n\n${end}`
+  return `${start}\n\n... [${fullMessage.length - maxErrorLength} characters truncated] ...\n\n${end}`
 }
 
 export function getErrorParts(error: Error): string[] {
   if (error instanceof ShellError) {
     return [
       `Exit code ${error.code}`,
-      error.interrupted ? INTERRUPT_MESSAGE_FOR_TOOL_USE : '',
+      error.interrupted
+        ? error.abortMessage ?? INTERRUPT_MESSAGE_FOR_TOOL_USE
+        : '',
       error.stderr,
       error.stdout,
     ]
@@ -100,7 +106,7 @@ export function formatZodValidationError(
   let errorContent = error.message
 
   // Build a human-readable error message
-  const errorParts = []
+  const errorParts: string[] = []
 
   if (missingParams.length > 0) {
     const missingParamErrors = missingParams.map(

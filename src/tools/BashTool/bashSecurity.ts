@@ -2,12 +2,18 @@ import { logEvent } from 'src/services/analytics/index.js'
 import { extractHeredocs } from '../../utils/bash/heredoc.js'
 import { ParsedCommand } from '../../utils/bash/ParsedCommand.js'
 import {
+  findForbiddenCommitMessagePattern,
+  getForbiddenCommitMessagePatterns,
+  isGeneratedCommitAttributionBlocked,
+} from '../../utils/governancePolicy.js'
+import {
   hasMalformedTokens,
   hasShellQuoteSingleQuoteBug,
   tryParseShellCommand,
 } from '../../utils/bash/shellQuote.js'
 import type { TreeSitterAnalysis } from '../../utils/bash/treeSitterAnalysis.js'
 import type { PermissionResult } from '../../utils/permissions/PermissionResult.js'
+import { isPermissiveSafety } from '../../utils/permissions/safetyLevel.js'
 
 const HEREDOC_IN_SUBSTITUTION = /\$\(.*<</
 
@@ -570,6 +576,22 @@ export function stripSafeHeredocSubstitutions(command: string): string | null {
     }
   }
   if (!found) return null
+
+  // SECURITY: Reject nested matches — same logic as isSafeHeredoc.
+  // When one range is nested inside another, processing in reverse order leaves
+  // outer.end stale after the inner strip. result.slice(outer.end) then skips
+  // any suffix after the outer heredoc (e.g., `; rm -rf /`), silently dropping
+  // it from the remaining text and hiding it from downstream validators.
+  // Return null so callers fall back to full command validation.
+  for (const outer of ranges) {
+    for (const inner of ranges) {
+      if (inner === outer) continue
+      if (inner.start > outer.start && inner.start < outer.end) {
+        return null
+      }
+    }
+  }
+
   for (let i = ranges.length - 1; i >= 0; i--) {
     const r = ranges[i]!
     result = result.slice(0, r.start) + result.slice(r.end)
@@ -607,6 +629,313 @@ function validateSafeCommandSubstitution(
     behavior: 'passthrough',
     message: 'Command substitution needs validation',
   }
+}
+
+function takeShellToken(input: string): string | null {
+  const match = input.match(/^(?:"[^"\n\r]*"|'[^'\n\r]*'|[^ \t\n\r;&|`$<>()]+)/)
+  return match?.[0] ?? null
+}
+
+function stripLeadingSafeEnvAssignments(command: string): string {
+  let rest = command.trimStart()
+  for (;;) {
+    const match = rest.match(
+      /^[A-Za-z_][A-Za-z0-9_]*(?:\+)?=(?:"[^"$`\n\r]*"|'[^'\n\r]*'|[^ \t\n\r;&|`$<>()]*)[ \t]+/,
+    )
+    if (!match) return rest
+    rest = rest.slice(match[0].length)
+  }
+}
+
+function unquoteEnvSplitString(value: string): string {
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    const inner = value.slice(1, -1)
+    return value[0] === '"'
+      ? inner.replace(/\\(["\\$`])/g, '$1')
+      : inner
+  }
+  return value
+}
+
+function stripLeadingGitExecutionWrappers(command: string, depth = 0): string {
+  let rest = stripLeadingSafeEnvAssignments(command)
+
+  const commandMatch = rest.match(/^command[ \t]+/)
+  if (commandMatch) {
+    rest = rest.slice(commandMatch[0].length)
+    for (;;) {
+      const option = takeShellToken(rest)
+      if (option === '-p' || option === '--') {
+        rest = rest.slice(option.length).replace(/^[ \t]+/, '')
+        continue
+      }
+      break
+    }
+    return rest
+  }
+
+  const envMatch = rest.match(/^env[ \t]+/)
+  if (envMatch) {
+    rest = rest.slice(envMatch[0].length)
+    for (;;) {
+      const splitStringMatch = rest.match(
+        /^(?:-S|--split-string)[ \t]+((?:"(?:\\.|[^"\\])*"|'[^']*'|[^ \t]+))/,
+      )
+      const inlineSplitStringMatch = rest.match(
+        /^--split-string=((?:"(?:\\.|[^"\\])*"|'[^']*'|[^ \t]+))/,
+      )
+      if (splitStringMatch ?? inlineSplitStringMatch) {
+        const splitCommand = unquoteEnvSplitString(
+          (splitStringMatch ?? inlineSplitStringMatch)![1]!,
+        ).trimStart()
+        return depth < 2
+          ? stripLeadingGitExecutionWrappers(splitCommand, depth + 1)
+          : splitCommand
+      }
+
+      const token = takeShellToken(rest)
+      if (!token) return rest
+      if (/^[A-Za-z_][A-Za-z0-9_]*(?:\+)?=/.test(token)) {
+        rest = rest.slice(token.length).replace(/^[ \t]+/, '')
+        continue
+      }
+      if (
+        token === '-i' ||
+        token === '--ignore-environment' ||
+        token === '--'
+      ) {
+        rest = rest.slice(token.length).replace(/^[ \t]+/, '')
+        continue
+      }
+      if (token === '-u' || token === '--unset' || token === '-C' || token === '--chdir') {
+        rest = rest.slice(token.length).replace(/^[ \t]+/, '')
+        const value = takeShellToken(rest)
+        if (!value) return rest
+        rest = rest.slice(value.length).replace(/^[ \t]+/, '')
+        continue
+      }
+      if (
+        token.startsWith('-u') ||
+        token.startsWith('--unset=') ||
+        token.startsWith('-C') ||
+        token.startsWith('--chdir=')
+      ) {
+        rest = rest.slice(token.length).replace(/^[ \t]+/, '')
+        continue
+      }
+      break
+    }
+  }
+
+  return rest
+}
+
+function hasShellOperatorOutsideQuotes(command: string): boolean {
+  let quote: '"' | "'" | null = null
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i]
+    if (quote) {
+      if (char === quote) quote = null
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      continue
+    }
+    if (char === ';' || char === '|' || char === '&') {
+      return true
+    }
+  }
+  return false
+}
+
+function normalizeGitCommitCommand(command: string): string | null {
+  if (hasShellOperatorOutsideQuotes(command)) return null
+  const normalizedInput = stripLeadingGitExecutionWrappers(command)
+  const gitMatch = normalizedInput.match(/^(?:"git(?:\.exe)?"|'git(?:\.exe)?'|git(?:\.exe)?)[ \t]+/)
+  if (!gitMatch) return null
+
+  let rest = normalizedInput.slice(gitMatch[0].length)
+  for (;;) {
+    const commitMatch = rest.match(/^commit(?=$|[ \t])/)
+    if (commitMatch) {
+      return `git commit${rest.slice(commitMatch[0].length)}`
+    }
+
+    const flag = takeShellToken(rest)
+    if (!flag?.startsWith('-')) return null
+    rest = rest.slice(flag.length).replace(/^[ \t]+/, '')
+
+    const hasInlineValue = flag.includes('=')
+    const needsValue =
+      flag === '-C' ||
+      flag === '-c' ||
+      [
+        '--git-dir',
+        '--work-tree',
+        '--namespace',
+        '--super-prefix',
+        '--config-env',
+        '--exec-path',
+      ].includes(flag)
+
+    if (needsValue && !hasInlineValue) {
+      const value = takeShellToken(rest)
+      if (!value) return null
+      rest = rest.slice(value.length).replace(/^[ \t]+/, '')
+    }
+  }
+}
+
+function hasExpandableShellText(message: string): boolean {
+  return /(^|[^\\])(?:\$[\w{(]|`)/.test(message)
+}
+
+function extractGitCommitMessages(command: string): {
+  messages: string[]
+  hasUninspectableSource: boolean
+} {
+  const normalizedCommand = normalizeGitCommitCommand(command)
+  if (!normalizedCommand) {
+    return { messages: [], hasUninspectableSource: false }
+  }
+
+  const messages: string[] = []
+  let hasUninspectableSource = false
+  const simpleMessagePattern =
+    /(?:^|[ \t])(?:-m|--message)[ \t]+(["'])([\s\S]*?)\1|(?:^|[ \t])--message=(["'])([\s\S]*?)\3/g
+  for (const match of normalizedCommand.matchAll(simpleMessagePattern)) {
+    const quote = match[1] ?? match[3]
+    const message = match[2] ?? match[4] ?? ''
+    if (
+      quote === '"' &&
+      hasExpandableShellText(message) &&
+      !/^\$\(cat[ \t]+<</.test(message)
+    ) {
+      hasUninspectableSource = true
+      continue
+    }
+    messages.push(message)
+  }
+
+  const unquotedMessagePattern =
+    /(?:^|[ \t])(?:-m|--message)[ \t]+([^"' \t\n\r;&|]+)|(?:^|[ \t])--message=([^"' \t\n\r;&|]+)/g
+  for (const match of normalizedCommand.matchAll(unquotedMessagePattern)) {
+    const message = match[1] ?? match[2] ?? ''
+    if (message === '$(cat') {
+      const rest = normalizedCommand.slice((match.index ?? 0) + match[0].length)
+      if (/^[ \t]+<</.test(rest)) {
+        continue
+      }
+      hasUninspectableSource = true
+      continue
+    }
+    if (hasExpandableShellText(message) || /[<>()]/.test(message)) {
+      hasUninspectableSource = true
+      continue
+    }
+    messages.push(message)
+  }
+
+  const heredocMessagePattern =
+    /(?:^|[ \t])(?:-m|--message)[ \t]+(["']?)\$\(cat[ \t]+<<(['\\]?)([A-Za-z_][A-Za-z0-9_-]*)\2\n([\s\S]*?)\n\3\n?\)\1|(?:^|[ \t])--message=(["']?)\$\(cat[ \t]+<<(['\\]?)([A-Za-z_][A-Za-z0-9_-]*)\6\n([\s\S]*?)\n\7\n?\)\5/g
+  for (const match of normalizedCommand.matchAll(heredocMessagePattern)) {
+    const delimiterQuote = match[2] ?? match[6] ?? ''
+    const message = match[4] ?? match[8] ?? ''
+    if (delimiterQuote !== "'" && delimiterQuote !== '\\') {
+      hasUninspectableSource = true
+      continue
+    }
+    messages.push(message)
+  }
+
+  return { messages, hasUninspectableSource }
+}
+
+function gitCommitUsesFileMessage(command: string): boolean {
+  const normalizedCommand = normalizeGitCommitCommand(command)
+  if (!normalizedCommand) return false
+
+  return /(?:^|[ \t])(?:-F|--file)[ \t]+(?:"[^"\n\r]*"|'[^'\n\r]*'|[^ \t\n\r;&|`$<>()]+)|(?:^|[ \t])--file=(?:"[^"\n\r]*"|'[^'\n\r]*'|[^ \t\n\r;&|`$<>()]+)/.test(
+    normalizedCommand,
+  )
+}
+
+function hasCommitMessagePolicyRestrictions(): boolean {
+  return (
+    getForbiddenCommitMessagePatterns().length > 0 ||
+    isGeneratedCommitAttributionBlocked()
+  )
+}
+
+function commitPolicyAsk(message: string): PermissionResult {
+  return {
+    behavior: 'ask',
+    message,
+    decisionReason: {
+      type: 'safetyCheck',
+      reason: message,
+      classifierApprovable: false,
+    },
+  }
+}
+
+export function checkBashCommitMessagePolicy(
+  command: string,
+): PermissionResult | null {
+  const normalizedCommand = normalizeGitCommitCommand(command)
+  if (!normalizedCommand) return null
+
+  const hasPolicyRestrictions = hasCommitMessagePolicyRestrictions()
+
+  if (gitCommitUsesFileMessage(command) && hasPolicyRestrictions) {
+    return commitPolicyAsk(
+      'Git commit message is loaded from a file and cannot be checked against commit-message policy',
+    )
+  }
+
+  const { messages, hasUninspectableSource } = extractGitCommitMessages(command)
+  if (
+    (hasUninspectableSource || messages.length === 0) &&
+    hasPolicyRestrictions
+  ) {
+    return commitPolicyAsk(
+      'Git commit message source cannot be checked against commit-message policy',
+    )
+  }
+
+  for (const message of messages) {
+    const forbiddenPattern = findForbiddenCommitMessagePattern(message)
+    if (forbiddenPattern) {
+      return commitPolicyAsk(
+        `Git commit message contains forbidden pattern: ${forbiddenPattern}`,
+      )
+    }
+    if (
+      isGeneratedCommitAttributionBlocked() &&
+      /Co-Authored-By:|Generated with/i.test(message)
+    ) {
+      return commitPolicyAsk(
+        'Git commit message contains AI attribution that is disabled by policy',
+      )
+    }
+  }
+
+  return null
+}
+
+function validateGitCommitMessagePolicy(
+  context: ValidationContext,
+): PermissionResult {
+  const result = checkBashCommitMessagePolicy(context.originalCommand)
+  if (result) return result
+  if (!normalizeGitCommitCommand(context.originalCommand)) {
+    return { behavior: 'passthrough', message: 'Not a git commit' }
+  }
+  return { behavior: 'passthrough', message: 'No commit policy violation' }
 }
 
 function validateGitCommit(context: ValidationContext): PermissionResult {
@@ -2220,10 +2549,14 @@ function validateZshDangerousCommands(
     }
   }
 
-  // Check for `fc -e` which allows executing arbitrary commands via editor
+  // Check for `fc -e` which allows executing arbitrary commands via editor.
   // fc without -e is safe (just lists history), but -e specifies an editor
-  // to run on the command, effectively an eval
-  if (baseCmd === 'fc' && /\s-\S*e/.test(trimmed)) {
+  // to run on the command, effectively an eval. The regex requires `e` to
+  // be the last letter in a short POSIX-style flag bundle (matches `-e`,
+  // `-le`, `-lne`) and caps the bundle at 4 chars total so unrelated
+  // long-style flags like `-reset`, `-reverse`, or `-message` do not
+  // false-positive on `e` appearing mid-flag or at the end of a long word.
+  if (baseCmd === 'fc' && /\s-[a-zA-Z]{0,3}e(?:\s|$)/.test(trimmed)) {
     logEvent('tengu_bash_security_check_triggered', {
       checkId: BASH_SECURITY_CHECK_IDS.ZSH_DANGEROUS_COMMANDS,
       subId: 2,
@@ -2257,6 +2590,13 @@ const CONTROL_CHAR_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/
 export function bashCommandIsSafe_DEPRECATED(
   command: string,
 ): PermissionResult {
+  if (isPermissiveSafety()) {
+    return {
+      behavior: 'passthrough',
+      message: 'Command allowed because permissive safety level is enabled',
+    }
+  }
+
   // SECURITY: Block control characters before any other processing. Null bytes
   // and other non-printable chars are silently dropped by bash but confuse our
   // validators, allowing metacharacters adjacent to them to slip through.
@@ -2308,6 +2648,7 @@ export function bashCommandIsSafe_DEPRECATED(
   const earlyValidators = [
     validateEmpty,
     validateIncompleteCommands,
+    validateGitCommitMessagePolicy,
     validateSafeCommandSubstitution,
     validateGitCommit,
   ]
@@ -2427,6 +2768,13 @@ export async function bashCommandIsSafeAsync_DEPRECATED(
   command: string,
   onDivergence?: () => void,
 ): Promise<PermissionResult> {
+  if (isPermissiveSafety()) {
+    return {
+      behavior: 'passthrough',
+      message: 'Command allowed because permissive safety level is enabled',
+    }
+  }
+
   // Try to get tree-sitter analysis
   const parsed = await ParsedCommand.parse(command)
   const tsAnalysis = parsed?.getTreeSitterAnalysis() ?? null
@@ -2518,6 +2866,7 @@ export async function bashCommandIsSafeAsync_DEPRECATED(
   const earlyValidators = [
     validateEmpty,
     validateIncompleteCommands,
+    validateGitCommitMessagePolicy,
     validateSafeCommandSubstitution,
     validateGitCommit,
   ]

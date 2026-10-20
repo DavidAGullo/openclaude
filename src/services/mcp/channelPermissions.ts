@@ -23,6 +23,7 @@
  * See PR discussion 2956440848.
  */
 
+import { jsonRedactor, redactSensitiveInfo } from '../../utils/redaction.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../analytics/growthbook.js'
 
@@ -152,6 +153,21 @@ export function shortRequestId(toolUseID: string): string {
 }
 
 /**
+ * Build a channel request ID from the complete local owner identity. Tool-use
+ * IDs are only conversation-scoped, so concurrent subagents can legitimately
+ * reuse one without being the same pending permission request.
+ */
+export function channelPermissionRequestId(
+  toolUseID: string,
+  permissionSessionId?: string,
+  agentId?: string,
+): string {
+  return shortRequestId(
+    JSON.stringify([permissionSessionId ?? null, agentId ?? null, toolUseID]),
+  )
+}
+
+/**
  * Truncate tool input to a phone-sized JSON preview. 200 chars is
  * roughly 3 lines on a narrow phone screen. Full input is in the local
  * terminal dialog; the channel gets a summary so Write(5KB-file) doesn't
@@ -159,8 +175,14 @@ export function shortRequestId(toolUseID: string): string {
  */
 export function truncateForPreview(input: unknown): string {
   try {
-    const s = jsonStringify(input)
-    return s.length > 200 ? s.slice(0, 200) + '…' : s
+    // jsonRedactor collapses credential-shaped keys (token, auth, password)
+    // and URL-query redacts string values before the free-text pass.
+    const structurallyRedacted = JSON.parse(
+      JSON.stringify(input, jsonRedactor),
+    )
+    const s = jsonStringify(structurallyRedacted)
+    const redacted = redactSensitiveInfo(s)
+    return redacted.length > 200 ? redacted.slice(0, 200) + '…' : redacted
   } catch {
     return '(unserializable)'
   }
@@ -173,23 +195,31 @@ export function truncateForPreview(input: unknown): string {
  * server's explicit opt-in — a relay-only channel never becomes a
  * permission surface by accident (Kenneth's "users may be unpleasantly
  * surprised"). Centralized here so a future fourth condition lands once.
+ *
+ * The `isInAllowlist` predicate receives the runtime `pluginSource` (when
+ * available) so the caller can do marketplace-aware matching — see
+ * `findChannelEntry(name, allowedChannels, pluginSource)` in
+ * `channelNotification.ts`. A bare-name match is unsafe for plugin-kind
+ * entries: a `plugin:slack@evilcorp` installation would otherwise piggy-
+ * back on a `plugin:slack@anthropic` session entry.
  */
 export function filterPermissionRelayClients<
   T extends {
     type: string
     name: string
     capabilities?: { experimental?: Record<string, unknown> }
+    config?: { pluginSource?: string }
   },
 >(
   clients: readonly T[],
-  isInAllowlist: (name: string) => boolean,
+  isInAllowlist: (name: string, pluginSource?: string) => boolean,
 ): (T & { type: 'connected' })[] {
   return clients.filter(
     (c): c is T & { type: 'connected' } =>
       c.type === 'connected' &&
-      isInAllowlist(c.name) &&
-      c.capabilities?.experimental?.['claude/channel'] !== undefined &&
-      c.capabilities?.experimental?.['claude/channel/permission'] !== undefined,
+      isInAllowlist(c.name, c.config?.pluginSource) &&
+      Boolean(c.capabilities?.experimental?.['claude/channel']) &&
+      Boolean(c.capabilities?.experimental?.['claude/channel/permission']),
   )
 }
 

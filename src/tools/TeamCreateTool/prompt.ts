@@ -13,13 +13,11 @@ When in doubt about whether a task warrants a team, prefer spawning a team.
 
 ## Choosing Agent Types for Teammates
 
-When spawning teammates via the Agent tool, choose the \`subagent_type\` based on what tools the agent needs for its task. Each agent type has a different set of available tools — match the agent to the work:
+When spawning teammates via the Agent tool (with \`team_name\` and \`name\`), follow these rules:
 
-- **Read-only agents** (e.g., Explore, Plan) cannot edit or write files. Only assign them research, search, or planning tasks. Never assign them implementation work.
-- **Full-capability agents** (e.g., general-purpose) have access to all tools including file editing, writing, and bash. Use these for tasks that require making changes.
-- **Custom agents** defined in \`.claude/agents/\` may have their own tool restrictions. Check their descriptions to understand what they can and cannot do.
-
-Always review the agent type descriptions and their available tools listed in the Agent tool prompt before selecting a \`subagent_type\` for a teammate.
+- **Omit \`subagent_type\`** to spawn a default full-capability teammate. This is the standard choice for tasks that require making changes — editing files, running bash, writing code.
+- **Set a custom \`subagent_type\`** only when you have a custom agent defined in \`.openclaude/agents/\` that fits the task. Check the agent's description and tool restrictions before selecting it.
+- **Do NOT use built-in types** (e.g., \`Explore\`, \`Plan\`, \`code-reviewer\`, \`general-purpose\`) as \`subagent_type\` on a teammate spawn. Built-in types are rejected with an error on the teammate path. To use Explore, Plan, or code-reviewer, call the Agent tool without \`name\` and \`team_name\` so it runs as a standard subagent, not a teammate.
 
 Create a new team to coordinate multiple agents working on a project. Teams have a 1:1 correspondence with task lists (Team = TaskList).
 
@@ -31,8 +29,8 @@ Create a new team to coordinate multiple agents working on a project. Teams have
 \`\`\`
 
 This creates:
-- A team file at \`~/.claude/teams/{team-name}/config.json\`
-- A corresponding task list directory at \`~/.claude/tasks/{team-name}/\`
+- A team file at \`~/.openclaude/teams/{team-name}/config.json\`
+- A corresponding task list directory at \`~/.openclaude/tasks/{team-name}/\`
 
 ## Team Workflow
 
@@ -74,7 +72,7 @@ Teammates go idle after every turn—this is completely normal and expected. A t
 ## Discovering Team Members
 
 Teammates can read the team config file to discover other team members:
-- **Team config location**: \`~/.claude/teams/{team-name}/config.json\`
+- **Team config location**: \`~/.openclaude/teams/{team-name}/config.json\`
 
 The config file contains a \`members\` array with each teammate's:
 - \`name\`: Human-readable name (**always use this** for messaging and task assignment)
@@ -87,12 +85,12 @@ The config file contains a \`members\` array with each teammate's:
 
 Example of reading team config:
 \`\`\`
-Use the Read tool to read ~/.claude/teams/{team-name}/config.json
+Use the Read tool to read ~/.openclaude/teams/{team-name}/config.json
 \`\`\`
 
 ## Task List Coordination
 
-Teams share a task list that all teammates can access at \`~/.claude/tasks/{team-name}/\`.
+Teams share a task list that all teammates can access at \`~/.openclaude/tasks/{team-name}/\`.
 
 Teammates should:
 1. Check TaskList periodically, **especially after completing each task**, to find available work or see newly unblocked tasks

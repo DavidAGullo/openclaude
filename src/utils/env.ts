@@ -3,12 +3,29 @@ import { homedir } from 'os'
 import { join } from 'path'
 import { fileSuffixForOauthConfig } from '../constants/oauth.js'
 import { isRunningWithBun } from './bundledMode.js'
-import { getClaudeConfigHomeDir, isEnvTruthy } from './envUtils.js'
+import { createCombinedAbortSignal } from './combinedAbortSignal.js'
+import {
+  getClaudeConfigHomeDir,
+  isEnvTruthy,
+  resolveConfigDirEnv,
+} from './envUtils.js'
 import { findExecutable } from './findExecutable.js'
 import { getFsImplementation } from './fsOperations.js'
 import { which } from './which.js'
 
 type Platform = 'win32' | 'darwin' | 'linux'
+
+export function resolveGlobalClaudeFile(options: {
+  configDirEnv?: string
+  homeDir?: string
+  oauthSuffix?: string
+}): string {
+  const oauthSuffix = options.oauthSuffix ?? ''
+  const configDir = options.configDirEnv || options.homeDir || homedir()
+  const newFilename = `.openclaude${oauthSuffix}.json`
+
+  return join(configDir, newFilename)
+}
 
 // Config and data paths
 export const getGlobalClaudeFile = memoize((): string => {
@@ -22,29 +39,32 @@ export const getGlobalClaudeFile = memoize((): string => {
   }
 
   const oauthSuffix = fileSuffixForOauthConfig()
-  const configDir = process.env.CLAUDE_CONFIG_DIR || homedir()
+  const configDirEnv = resolveConfigDirEnv({
+    openClaudeConfigDir: process.env.OPENCLAUDE_CONFIG_DIR,
+  })
+  const configDir = configDirEnv || homedir()
 
-  // Default to .openclaude.json. Fall back to .claude.json only if the new
-  // file doesn't exist yet and the legacy one does (same migration pattern
-  // as resolveClaudeConfigHomeDir for the config directory).
-  const newFilename = `.openclaude${oauthSuffix}.json`
-  const legacyFilename = `.claude${oauthSuffix}.json`
-  if (
-    !getFsImplementation().existsSync(join(configDir, newFilename)) &&
-    getFsImplementation().existsSync(join(configDir, legacyFilename))
-  ) {
-    return join(configDir, legacyFilename)
-  }
-  return join(configDir, newFilename)
+  return resolveGlobalClaudeFile({
+    configDirEnv,
+    homeDir: configDir,
+    oauthSuffix,
+  })
 })
 
 const hasInternetAccess = memoize(async (): Promise<boolean> => {
   try {
     const { default: axiosClient } = await import('axios')
-    await axiosClient.head('http://1.1.1.1', {
-      signal: AbortSignal.timeout(1000),
+    const { signal, cleanup } = createCombinedAbortSignal(undefined, {
+      timeoutMs: 1000,
     })
-    return true
+    try {
+      await axiosClient.head('http://1.1.1.1', {
+        signal,
+      })
+      return true
+    } finally {
+      cleanup()
+    }
   } catch {
     return false
   }
@@ -60,7 +80,7 @@ async function isCommandAvailable(command: string): Promise<boolean> {
 }
 
 const detectPackageManagers = memoize(async (): Promise<string[]> => {
-  const packageManagers = []
+  const packageManagers: string[] = []
 
   if (await isCommandAvailable('npm')) packageManagers.push('npm')
   if (await isCommandAvailable('yarn')) packageManagers.push('yarn')
@@ -70,7 +90,7 @@ const detectPackageManagers = memoize(async (): Promise<string[]> => {
 })
 
 const detectRuntimes = memoize(async (): Promise<string[]> => {
-  const runtimes = []
+  const runtimes: string[] = []
 
   if (await isCommandAvailable('bun')) runtimes.push('bun')
   if (await isCommandAvailable('deno')) runtimes.push('deno')
@@ -146,16 +166,21 @@ export const JETBRAINS_IDES = [
 
 // Detect terminal type with fallbacks for all platforms
 function detectTerminal(): string | null {
+  const askpassMain = process.env.VSCODE_GIT_ASKPASS_MAIN?.toLowerCase()
   if (process.env.CURSOR_TRACE_ID) return 'cursor'
   // Cursor and Windsurf under WSL have TERM_PROGRAM=vscode
-  if (process.env.VSCODE_GIT_ASKPASS_MAIN?.includes('cursor')) {
+  if (askpassMain?.includes('cursor')) {
     return 'cursor'
   }
-  if (process.env.VSCODE_GIT_ASKPASS_MAIN?.includes('windsurf')) {
+  if (askpassMain?.includes('windsurf')) {
     return 'windsurf'
   }
-  if (process.env.VSCODE_GIT_ASKPASS_MAIN?.includes('antigravity')) {
-    return 'antigravity'
+  if (
+    askpassMain?.includes('antigravity') ||
+    askpassMain?.includes('agy') ||
+    process.env.TERM_PROGRAM === 'agy'
+  ) {
+    return 'agy'
   }
   const bundleId = process.env.__CFBundleIdentifier?.toLowerCase()
   if (bundleId?.includes('vscodium')) return 'codium'

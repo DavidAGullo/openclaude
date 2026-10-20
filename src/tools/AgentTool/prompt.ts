@@ -88,9 +88,11 @@ Fork yourself (omit \`subagent_type\`) when the intermediate tool output isn't w
 
 Forks are cheap because they share your prompt cache. Don't set \`model\` on a fork \u2014 a different model can't reuse the parent's cache. Pass a short \`name\` (one or two words, lowercase) so the user can see the fork in the teams panel and steer it mid-run.
 
-**Don't peek.** The tool result includes an \`output_file\` path — do not Read or tail it unless the user explicitly asks for a progress check. You get a completion notification; trust it. Reading the transcript mid-flight pulls the fork's tool noise into your context, which defeats the point of forking.
+**Don't peek.** The tool result includes an \`output_file\` path — do not Read or tail it unless the user explicitly asks for a progress check. You get a completion notification; trust it. Reading the transcript mid-flight pulls the fork's tool noise into your context, which defeats the point of forking. If you need to course-correct, use SendMessage — never Read.
 
 **Don't race.** After launching, you know nothing about what the fork found. Never fabricate or predict fork results in any format — not as prose, summary, or structured output. The notification arrives as a user-role message in a later turn; it is never something you write yourself. If the user asks a follow-up before the notification lands, tell them the fork is still running — give status, not a guess.
+
+**Don't take over.** A fork that looks stuck is usually in its read phase, not failing. Course-correct with SendMessage; never write its output yourself or discard its result when it lands. Override belongs to the Review phase.
 
 **Writing a fork prompt.** Since the fork inherits your context, the prompt is a *directive* — what to do, not what the situation is. Be specific about scope: what's in, what's out, what another agent is handling. Don't re-explain background.
 `
@@ -140,15 +142,15 @@ assistant: Still waiting on the audit \u2014 that's one of the things it's check
 
 <example>
 user: "Can you get a second opinion on whether this migration is safe?"
-assistant: <thinking>I'll ask the code-reviewer agent — it won't see my analysis, so it can give an independent read.</thinking>
+assistant: <thinking>I'll ask the code-reviewer agent — it won't see my analysis, so it can give an independent read. The code-reviewer requires the diff inline, so I need to include the changed hunks.</thinking>
 <commentary>
-A subagent_type is specified, so the agent starts fresh. It needs full context in the prompt. The briefing explains what to assess and why.
+A subagent_type is specified, so the agent starts fresh. It needs full context in the prompt. The code-reviewer contract requires the caller to provide the diff or changed hunks inline — the reviewer cannot run git diff itself.
+Note: do NOT add a name parameter here — code-reviewer is a built-in and will be rejected if spawned as a teammate. Omit name/team_name so it runs as a standard subagent.
 </commentary>
 ${AGENT_TOOL_NAME}({
-  name: "migration-review",
   description: "Independent migration review",
   subagent_type: "code-reviewer",
-  prompt: "Review migration 0042_user_schema.sql for safety. Context: we're adding a NOT NULL column to a 50M-row table. Existing rows get a backfill default. I want a second opinion on whether the backfill approach is safe under concurrent writes — I've checked locking behavior but want independent verification. Report: is this safe, and if not, what specifically breaks?"
+  prompt: "Review migration 0042_user_schema.sql for safety. Context: we're adding a NOT NULL column to a 50M-row table with a backfill default.\n\nHere is the diff:\n\`\`\`sql\n--- a/migrations/0042_user_schema.sql\n+++ b/migrations/0042_user_schema.sql\n@@ -0,0 +1,5 @@\n+ALTER TABLE users ADD COLUMN org_id INTEGER NOT NULL DEFAULT 0;\n+UPDATE users SET org_id = (SELECT id FROM orgs WHERE orgs.legacy_id = users.legacy_org_id);\n+ALTER TABLE users ALTER COLUMN org_id DROP DEFAULT;\n\`\`\`\n\nI want a second opinion on whether the backfill approach is safe under concurrent writes — I've checked locking behavior but want independent verification. Report: is this safe, and if not, what specifically breaks?"
 })
 </example>
 `
@@ -259,11 +261,8 @@ Usage notes:
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.)${forkEnabled ? '' : ", since it is not aware of the user's intent"}
 - If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
 - If the user specifies that they want you to run agents "in parallel", you MUST send a single message with multiple ${AGENT_TOOL_NAME} tool use content blocks. For example, if you need to launch both a build-validator agent and a test-runner agent in parallel, send a single message with both tool calls.
-- You can optionally set \`isolation: "worktree"\` to run the agent in a temporary git worktree, giving it an isolated copy of the repository. The worktree is automatically cleaned up if the agent makes no changes; if changes are made, the worktree path and branch are returned in the result.${
-    process.env.USER_TYPE === 'ant'
-      ? `\n- You can set \`isolation: "remote"\` to run the agent in a remote CCR environment. This is always a background task; you'll be notified when it completes. Use for long-running tasks that need a fresh sandbox.`
-      : ''
-  }${
+- You can optionally set \`isolation: "worktree"\` to run the agent in a temporary git worktree, giving it an isolated copy of the repository. The worktree is automatically cleaned up if the agent makes no changes; if changes are made, the worktree path and branch are returned in the result.
+- When the current session is outside a git repository (for example a parent folder that contains multiple git repos), set \`cwd\` to the absolute path of the target child repository. You can combine \`cwd\` with \`isolation: "worktree"\` so the worktree is created from that child repo. If worktree creation fails only because no git repository is available, the agent still runs with that \`cwd\` override instead of failing, and the tool result notes that worktree isolation was unavailable.${
     isInProcessTeammate()
       ? `
 - The run_in_background, name, team_name, and mode parameters are not available in this context. Only synchronous subagents are supported.`

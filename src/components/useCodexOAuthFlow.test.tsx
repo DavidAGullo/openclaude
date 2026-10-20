@@ -1,9 +1,13 @@
 import { PassThrough } from 'node:stream'
 
-import { afterEach, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, expect, mock, test } from 'bun:test'
 import React from 'react'
 
 import { createRoot, Text } from '../ink.js'
+import {
+  acquireSharedMutationLock,
+  releaseSharedMutationLock,
+} from '../test/sharedMutationLock.js'
 
 const SYNC_START = '\x1B[?2026h'
 const SYNC_END = '\x1B[?2026l'
@@ -91,8 +95,16 @@ const TOKENS = {
   apiKey: 'oauth-api-key',
 }
 
+beforeEach(async () => {
+  await acquireSharedMutationLock('components/useCodexOAuthFlow.test.tsx')
+})
+
 afterEach(() => {
-  mock.restore()
+  try {
+    mock.restore()
+  } finally {
+    releaseSharedMutationLock()
+  }
 })
 
 test('does not persist credentials when downstream setup rejects', async () => {
@@ -110,6 +122,7 @@ test('does not persist credentials when downstream setup rejects', async () => {
         return TOKENS
       },
       cleanup,
+      submitManualCallback: () => ({ ok: true as const }),
     }),
     openBrowser: async () => true,
     saveCodexCredentials,
@@ -121,13 +134,21 @@ test('does not persist credentials when downstream setup rejects', async () => {
   )
 
   function Harness(): React.ReactNode {
-    const handleAuthenticated = React.useCallback(onAuthenticated, [onAuthenticated])
+    const handleAuthenticated = React.useCallback(onAuthenticated, [
+      onAuthenticated,
+    ])
     const status = useCodexOAuthFlow({
       onAuthenticated: handleAuthenticated,
       deps,
     })
 
-    return <Text>{status.state === 'error' ? status.message : status.state}</Text>
+    return (
+      <Text>
+        {status.state === 'error'
+          ? `Codex OAuth failed: ${status.message}`
+          : status.state}
+      </Text>
+    )
   }
 
   const streams = createTestStreams()
@@ -172,6 +193,7 @@ test('persists credentials with profile linkage after downstream setup succeeds'
         return TOKENS
       },
       cleanup,
+      submitManualCallback: () => ({ ok: true as const }),
     }),
     openBrowser: async () => true,
     saveCodexCredentials,
@@ -183,7 +205,9 @@ test('persists credentials with profile linkage after downstream setup succeeds'
   )
 
   function Harness(): React.ReactNode {
-    const handleAuthenticated = React.useCallback(onAuthenticated, [onAuthenticated])
+    const handleAuthenticated = React.useCallback(onAuthenticated, [
+      onAuthenticated,
+    ])
     useCodexOAuthFlow({
       onAuthenticated: handleAuthenticated,
       deps,
@@ -211,6 +235,248 @@ test('persists credentials with profile linkage after downstream setup succeeds'
       accountId: TOKENS.accountId,
       profileId: 'profile_codex_oauth',
     })
+  } finally {
+    root.unmount()
+    streams.stdin.end()
+    streams.stdout.end()
+    await Bun.sleep(0)
+  }
+})
+
+test('returns a successful storage warning without entering the error state', async () => {
+  const saveCodexCredentials = mock(() => ({
+    success: true,
+    warning: 'Warning: Storing credentials in plaintext.',
+  }))
+  let storageWarning: string | undefined
+  const onAuthenticated = mock(
+    async (
+      _tokens: typeof TOKENS,
+      persistCredentials: (
+        options?: { profileId?: string },
+      ) => { warning?: string } | void,
+    ) => {
+      const result = persistCredentials({
+        profileId: 'profile_codex_oauth',
+      })
+      storageWarning =
+        result && typeof result === 'object' ? result.warning : undefined
+    },
+  )
+  const cleanup = mock(() => {})
+  const deps = {
+    createOAuthService: () => ({
+      async startOAuthFlow(
+        onAuthorizationUrl: (authUrl: string) => void | Promise<void>,
+      ) {
+        await onAuthorizationUrl('https://chatgpt.com/codex')
+        return TOKENS
+      },
+      cleanup,
+      submitManualCallback: () => ({ ok: true as const }),
+    }),
+    openBrowser: async () => true,
+    saveCodexCredentials,
+    isBareMode: () => false,
+  }
+
+  const { useCodexOAuthFlow } = await import(
+    `./useCodexOAuthFlow.js?real-persist-warning-${Date.now()}-${Math.random()}`
+  )
+
+  function Harness(): React.ReactNode {
+    const handleAuthenticated = React.useCallback(onAuthenticated, [onAuthenticated])
+    const status = useCodexOAuthFlow({
+      onAuthenticated: handleAuthenticated,
+      deps,
+    })
+
+    return (
+      <Text>
+        {status.state === 'error'
+          ? `Codex OAuth failed: ${status.message}`
+          : status.state}
+      </Text>
+    )
+  }
+
+  const streams = createTestStreams()
+  const root = await createRoot({
+    stdout: streams.stdout as unknown as NodeJS.WriteStream,
+    stdin: streams.stdin as unknown as NodeJS.ReadStream,
+    patchConsole: false,
+  })
+  root.render(<Harness />)
+
+  try {
+    await waitForCondition(() => saveCodexCredentials.mock.calls.length === 1)
+    await Bun.sleep(0)
+    expect(storageWarning).toBe('Warning: Storing credentials in plaintext.')
+    expect(extractLastFrame(streams.getOutput())).not.toContain(
+      'Codex OAuth failed',
+    )
+  } finally {
+    root.unmount()
+    streams.stdin.end()
+    streams.stdout.end()
+    await Bun.sleep(0)
+  }
+})
+
+test('reports credential persistence failures without token values', async () => {
+  const saveCodexCredentials = mock(() => ({
+    success: false,
+    warning: 'secure storage unavailable',
+  }))
+  const onAuthenticated = mock(
+    async (
+      _tokens: typeof TOKENS,
+      persistCredentials: (options?: { profileId?: string }) => void,
+    ) => {
+      persistCredentials({ profileId: 'profile_codex_oauth' })
+    },
+  )
+  const cleanup = mock(() => {})
+  const deps = {
+    createOAuthService: () => ({
+      async startOAuthFlow(
+        onAuthorizationUrl: (authUrl: string) => void | Promise<void>,
+      ) {
+        await onAuthorizationUrl('https://chatgpt.com/codex')
+        return TOKENS
+      },
+      cleanup,
+      submitManualCallback: () => ({ ok: true as const }),
+    }),
+    openBrowser: async () => true,
+    saveCodexCredentials,
+    isBareMode: () => false,
+  }
+
+  const { useCodexOAuthFlow } = await import(
+    `./useCodexOAuthFlow.js?real-persist-failure-${Date.now()}-${Math.random()}`
+  )
+
+  function Harness(): React.ReactNode {
+    const handleAuthenticated = React.useCallback(onAuthenticated, [onAuthenticated])
+    const status = useCodexOAuthFlow({
+      onAuthenticated: handleAuthenticated,
+      deps,
+    })
+
+    return <Text>{status.state === 'error' ? status.message : status.state}</Text>
+  }
+
+  const streams = createTestStreams()
+  const root = await createRoot({
+    stdout: streams.stdout as unknown as NodeJS.WriteStream,
+    stdin: streams.stdin as unknown as NodeJS.ReadStream,
+    patchConsole: false,
+  })
+  root.render(<Harness />)
+
+  try {
+    await waitForCondition(() =>
+      extractLastFrame(streams.getOutput()).includes(
+        'secure storage unavailable',
+      ),
+    )
+    const frame = extractLastFrame(streams.getOutput())
+    expect(frame).toContain('secure storage unavailable')
+    for (const value of Object.values(TOKENS)) {
+      expect(frame).not.toContain(value)
+    }
+  } finally {
+    root.unmount()
+    streams.stdin.end()
+    streams.stdout.end()
+    await Bun.sleep(0)
+  }
+})
+
+test('exposes submitManualCallback in the waiting state and delegates success and failure results', async () => {
+  // The service's manual-callback result is what the ProviderManager UI relies
+  // on; verify the hook surfaces it in the waiting status and passes both the
+  // raw input and the service's result straight back to the caller.
+  const submitManualCallback = mock((input: string) =>
+    input.includes('code=good')
+      ? ({ ok: true as const })
+      : ({ ok: false as const, error: 'State mismatch' }),
+  )
+  const cleanup = mock(() => {})
+  const deps = {
+    createOAuthService: () => ({
+      async startOAuthFlow(
+        onAuthorizationUrl: (authUrl: string) => void | Promise<void>,
+      ) {
+        await onAuthorizationUrl('https://chatgpt.com/codex')
+        // Stay in the waiting state so the manual-callback path is reachable.
+        return new Promise<typeof TOKENS>(() => {})
+      },
+      cleanup,
+      submitManualCallback,
+    }),
+    openBrowser: async () => false,
+    saveCodexCredentials: mock(() => ({ success: true })),
+    isBareMode: () => false,
+  }
+
+  const { useCodexOAuthFlow } = await import(
+    `./useCodexOAuthFlow.js?waiting-manual-${Date.now()}-${Math.random()}`
+  )
+
+  let latestStatus:
+    | {
+        state: string
+        submitManualCallback?: (
+          input: string,
+        ) => { ok: boolean; error?: string }
+      }
+    | undefined
+
+  // Stable reference: a fresh inline `onAuthenticated` on every render would
+  // re-run the hook's effect each render, restarting the OAuth flow and
+  // looping setStatus → render → setStatus ("Maximum update depth exceeded").
+  // The other tests in this file memoize the callback for the same reason.
+  const onAuthenticated = async (): Promise<void> => {}
+
+  function Harness(): React.ReactNode {
+    const status = useCodexOAuthFlow({
+      onAuthenticated,
+      deps,
+    })
+    latestStatus = status as typeof latestStatus
+    return <Text>{status.state}</Text>
+  }
+
+  const streams = createTestStreams()
+  const root = await createRoot({
+    stdout: streams.stdout as unknown as NodeJS.WriteStream,
+    stdin: streams.stdin as unknown as NodeJS.ReadStream,
+    patchConsole: false,
+  })
+  root.render(<Harness />)
+
+  try {
+    await waitForCondition(() => latestStatus?.state === 'waiting')
+    expect(latestStatus?.state).toBe('waiting')
+    expect(typeof latestStatus?.submitManualCallback).toBe('function')
+
+    const okResult = latestStatus?.submitManualCallback?.(
+      'http://localhost:41100/auth/callback?code=good&state=s',
+    )
+    expect(okResult).toEqual({ ok: true })
+
+    const failResult = latestStatus?.submitManualCallback?.(
+      'http://localhost:41100/auth/callback?code=bad&state=s',
+    )
+    expect(failResult?.ok).toBe(false)
+    expect(failResult?.error).toBe('State mismatch')
+
+    expect(submitManualCallback).toHaveBeenCalledTimes(2)
+    expect(submitManualCallback).toHaveBeenCalledWith(
+      'http://localhost:41100/auth/callback?code=good&state=s',
+    )
   } finally {
     root.unmount()
     streams.stdin.end()

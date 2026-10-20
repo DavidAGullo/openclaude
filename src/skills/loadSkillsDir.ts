@@ -27,7 +27,7 @@ import { logForDebugging } from '../utils/debug.js'
 import {
   EFFORT_LEVELS,
   type EffortValue,
-  parseEffortValue,
+  parseFrontmatterEffortValue,
 } from '../utils/effort.js'
 import {
   getClaudeConfigHomeDir,
@@ -52,6 +52,7 @@ import {
   getProjectDirsUpToHome,
   loadMarkdownFilesForSubdir,
   type MarkdownFile,
+  PROJECT_CONFIG_DIR_NAMES,
   parseSlashCommandToolsFromFrontmatter,
 } from '../utils/markdownConfigLoader.js'
 import { parseUserSpecifiedModel } from '../utils/model/model.js'
@@ -63,6 +64,14 @@ import { isRestrictedToPluginOnly } from '../utils/settings/pluginOnlyPolicy.js'
 import { HooksSchema, type HooksSettings } from '../utils/settings/types.js'
 import { createSignal } from '../utils/signal.js'
 import { registerMCPSkillBuilders } from './mcpSkillBuilders.js'
+import {
+  applySiblingSkillPrecedence,
+  getSiblingSkillsHomeDisplayPath,
+  getSiblingSkillsHomeId,
+  type ResolvedSiblingSkillsHome,
+  resolveSiblingSkillsHomes,
+  type SiblingSkillsHomeId,
+} from './siblingSkillHomes.js'
 
 export type LoadedFrom =
   | 'commands_DEPRECATED'
@@ -81,16 +90,34 @@ export function getSkillsPath(
 ): string {
   switch (source) {
     case 'policySettings':
-      return join(getManagedFilePath(), '.claude', dir)
+      return join(getManagedFilePath(), '.openclaude', dir)
     case 'userSettings':
       return join(getClaudeConfigHomeDir(), dir)
     case 'projectSettings':
-      return `.claude/${dir}`
+      return `.openclaude/${dir}`
     case 'plugin':
       return 'plugin'
     default:
       return ''
   }
+}
+
+export function getProjectSkillsPaths(dir: string): string[] {
+  return PROJECT_CONFIG_DIR_NAMES.map(configDirName =>
+    join(dir, configDirName, 'skills'),
+  )
+}
+
+function prefersOpenClaudeConfigDir(path: string): number {
+  return path.split(pathSep).includes('.openclaude') ? 0 : 1
+}
+
+function compareSkillDirPrecedence(a: string, b: string): number {
+  const depthDelta = b.split(pathSep).length - a.split(pathSep).length
+  if (depthDelta !== 0) {
+    return depthDelta
+  }
+  return prefersOpenClaudeConfigDir(a) - prefersOpenClaudeConfigDir(b)
 }
 
 /**
@@ -127,6 +154,24 @@ async function getFileIdentity(filePath: string): Promise<string | null> {
 type SkillWithPath = {
   skill: Command
   filePath: string
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+async function readSkillJsonMetadata(
+  skillDirPath: string,
+): Promise<Record<string, unknown>> {
+  try {
+    const raw = await getFsImplementation().readFile(join(skillDirPath, 'skill.json'), {
+      encoding: 'utf-8',
+    })
+    const parsed = JSON.parse(raw) as unknown
+    return isPlainObject(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
 }
 
 /**
@@ -227,10 +272,12 @@ export function parseSkillFrontmatterFields(
 
   const effortRaw = frontmatter['effort']
   const effort =
-    effortRaw !== undefined ? parseEffortValue(effortRaw) : undefined
+    effortRaw !== undefined ? parseFrontmatterEffortValue(effortRaw) : undefined
   if (effortRaw !== undefined && effort === undefined) {
     logForDebugging(
-      `Skill ${resolvedName} has invalid effort '${effortRaw}'. Valid options: ${EFFORT_LEVELS.join(', ')} or an integer`,
+      String(effortRaw).toLowerCase() === 'ultracode'
+        ? `Skill ${resolvedName} requested effort 'ultracode', a session-only mode not supported in frontmatter; ignoring.`
+        : `Skill ${resolvedName} has invalid effort '${effortRaw}'. Valid options: ${EFFORT_LEVELS.filter(l => l !== 'ultracode').join(', ')} or an integer`,
     )
   }
 
@@ -283,6 +330,7 @@ export function createSkillCommand({
   userInvocable,
   source,
   baseDir,
+  skillFilePath,
   loadedFrom,
   hooks,
   executionContext,
@@ -290,6 +338,8 @@ export function createSkillCommand({
   paths,
   effort,
   shell,
+  skillTrust,
+  siblingSkillsHome,
 }: {
   skillName: string
   displayName: string | undefined
@@ -306,6 +356,7 @@ export function createSkillCommand({
   userInvocable: boolean
   source: PromptCommand['source']
   baseDir: string | undefined
+  skillFilePath: string | undefined
   loadedFrom: LoadedFrom
   hooks: HooksSettings | undefined
   executionContext: 'inline' | 'fork' | undefined
@@ -313,6 +364,8 @@ export function createSkillCommand({
   paths: string[] | undefined
   effort: EffortValue | undefined
   shell: FrontmatterShell | undefined
+  skillTrust: string | undefined
+  siblingSkillsHome?: SiblingSkillsHomeId
 }): Command {
   return {
     type: 'prompt',
@@ -341,6 +394,9 @@ export function createSkillCommand({
     loadedFrom,
     hooks,
     skillRoot: baseDir,
+    skillFilePath,
+    skillTrust,
+    siblingSkillsHome,
     async getPromptForCommand(args, toolUseContext) {
       let finalContent = baseDir
         ? `Base directory for this skill: ${baseDir}\n\n${markdownContent}`
@@ -503,9 +559,10 @@ async function findSkillMarkdownFiles(basePath: string): Promise<string[]> {
  * Loads skills from a /skills/ directory path.
  * Supports nested directory format: category/skill/SKILL.md
  */
-async function loadSkillsFromSkillsDir(
+export async function loadSkillsFromSkillsDir(
   basePath: string,
   source: SettingSource,
+  siblingSkillsHome?: SiblingSkillsHomeId,
 ): Promise<SkillWithPath[]> {
   const fs = getFsImplementation()
   const skillFiles = await findSkillMarkdownFiles(basePath)
@@ -533,6 +590,7 @@ async function loadSkillsFromSkillsDir(
           content,
           skillFilePath,
         )
+        const skillJsonMetadata = await readSkillJsonMetadata(skillDirPath)
 
         const skillName = getSkillCommandName(skillFilePath, basePath)
         const parsed = parseSkillFrontmatterFields(
@@ -549,8 +607,14 @@ async function loadSkillsFromSkillsDir(
             markdownContent,
             source,
             baseDir: skillDirPath,
+            skillFilePath,
             loadedFrom: 'skills',
             paths,
+            skillTrust:
+              typeof skillJsonMetadata.trust === 'string'
+                ? skillJsonMetadata.trust
+                : undefined,
+            siblingSkillsHome,
           }),
           filePath: skillFilePath,
         }
@@ -690,8 +754,10 @@ async function loadSkillsFromCommandsDir(
             markdownContent: content,
             source,
             baseDir: skillDirectory,
+            skillFilePath: filePath,
             loadedFrom: 'commands_DEPRECATED',
             paths: undefined,
+            skillTrust: undefined,
           }),
           filePath,
         })
@@ -705,6 +771,13 @@ async function loadSkillsFromCommandsDir(
     logError(error)
     return []
   }
+}
+
+let siblingScanGeneration = 0
+
+/** Also fences command aggregation that waits on other sources after this scan. */
+export function getSiblingSkillScanGeneration(): number {
+  return siblingScanGeneration
 }
 
 /**
@@ -722,9 +795,13 @@ async function loadSkillsFromCommandsDir(
  */
 export const getSkillDirCommands = memoize(
   async (cwd: string): Promise<Command[]> => {
+    const scanGeneration = siblingScanGeneration
     const userSkillsDir = join(getClaudeConfigHomeDir(), 'skills')
-    const managedSkillsDir = join(getManagedFilePath(), '.claude', 'skills')
-    const projectSkillsDirs = getProjectDirsUpToHome('skills', cwd)
+    const managedSkillsDir = join(getManagedFilePath(), '.openclaude', 'skills')
+    const projectSkillsDirs = getProjectDirsUpToHome(
+      'skills',
+      cwd,
+    ).sort(compareSkillDirPrecedence)
 
     logForDebugging(
       `Loading skills from: managed=${managedSkillsDir}, user=${userSkillsDir}, project=[${projectSkillsDirs.join(', ')}]`,
@@ -748,16 +825,21 @@ export const getSkillDirCommands = memoize(
         return []
       }
       const additionalSkillsNested = await Promise.all(
-        additionalDirs.map(dir =>
-          loadSkillsFromSkillsDir(
-            join(dir, '.claude', 'skills'),
-            'projectSettings',
-          ),
-        ),
+        additionalDirs
+          .flatMap(getProjectSkillsPaths)
+          .sort(compareSkillDirPrecedence)
+          .map(dir => loadSkillsFromSkillsDir(dir, 'projectSettings')),
       )
       // No dedup needed — explicit dirs, user controls uniqueness.
       return additionalSkillsNested.flat().map(s => s.skill)
     }
+
+    // Other agents' skills homes (~/.agents/skills, ~/.claude/skills) are
+    // read-only, user-level, and rank below every OpenClaude-owned source.
+    const siblingHomes = resolveSiblingSkillsHomes()
+    const userSkillsEnabled =
+      isSettingSourceEnabled('userSettings') && !skillsLocked
+    const enabledSiblingHomes = getEnabledSiblingSkillsHomes(siblingHomes)
 
     // Load from /skills/ directories, additional dirs, and legacy /commands/ in parallel
     // (all independent — different directories, no shared state)
@@ -767,11 +849,12 @@ export const getSkillDirCommands = memoize(
       projectSkillsNested,
       additionalSkillsNested,
       legacyCommands,
+      siblingSkillsNested,
     ] = await Promise.all([
       isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_POLICY_SKILLS)
         ? Promise.resolve([])
         : loadSkillsFromSkillsDir(managedSkillsDir, 'policySettings'),
-      isSettingSourceEnabled('userSettings') && !skillsLocked
+      userSkillsEnabled
         ? loadSkillsFromSkillsDir(userSkillsDir, 'userSettings')
         : Promise.resolve([]),
       projectSettingsEnabled
@@ -783,12 +866,10 @@ export const getSkillDirCommands = memoize(
         : Promise.resolve([]),
       projectSettingsEnabled
         ? Promise.all(
-            additionalDirs.map(dir =>
-              loadSkillsFromSkillsDir(
-                join(dir, '.claude', 'skills'),
-                'projectSettings',
-              ),
-            ),
+            additionalDirs
+              .flatMap(getProjectSkillsPaths)
+              .sort(compareSkillDirPrecedence)
+              .map(dir => loadSkillsFromSkillsDir(dir, 'projectSettings')),
           )
         : Promise.resolve([]),
       // Legacy commands-as-skills goes through markdownConfigLoader with
@@ -796,15 +877,22 @@ export const getSkillDirCommands = memoize(
       // here when skills are locked — these ARE skills, regardless of the
       // directory they load from.
       skillsLocked ? Promise.resolve([]) : loadSkillsFromCommandsDir(cwd),
+      Promise.all(
+        enabledSiblingHomes.map(home =>
+          loadSkillsFromSkillsDir(home.path, 'userSettings', home.id),
+        ),
+      ),
     ])
 
-    // Flatten and combine all skills
+    // Flatten and combine all skills. Sibling-home skills go last so the
+    // same-file dedup below keeps the OpenClaude-owned copy of a symlinked skill.
     const allSkillsWithPaths = [
       ...managedSkills,
-      ...userSkills,
       ...projectSkillsNested.flat(),
       ...additionalSkillsNested.flat(),
+      ...userSkills,
       ...legacyCommands,
+      ...siblingSkillsNested.flat(),
     ]
 
     // Deduplicate by resolved path (handles symlinks and duplicate parent directories)
@@ -828,6 +916,9 @@ export const getSkillDirCommands = memoize(
       const entry = allSkillsWithPaths[i]
       if (entry === undefined || entry.skill.type !== 'prompt') continue
       const { skill } = entry
+      // A source clear can finish while reads or realpath calls are pending.
+      // Obsolete siblings must not return or repopulate the conditional map.
+      if (getSiblingSkillsHomeId(skill) && scanGeneration !== siblingScanGeneration) continue
 
       const fileId = fileIds[i]
       if (fileId === null || fileId === undefined) {
@@ -853,10 +944,20 @@ export const getSkillDirCommands = memoize(
       logForDebugging(`Deduplicated ${duplicatesRemoved} skills (same file)`)
     }
 
+    // Sibling-home skills never shadow an OpenClaude skill of the same name,
+    // and the first sibling home wins a name shared by both homes.
+    const resolvedSkills = applySiblingSkillPrecedence(deduplicatedSkills)
+    const siblingSkillCount = logSiblingSkillHomes(
+      siblingHomes,
+      userSkillsEnabled,
+      siblingSkillsNested.map(skills => skills.length),
+      resolvedSkills,
+    )
+
     // Separate conditional skills (with paths frontmatter) from unconditional ones
     const unconditionalSkills: Command[] = []
     const newConditionalSkills: Command[] = []
-    for (const skill of deduplicatedSkills) {
+    for (const skill of resolvedSkills) {
       if (
         skill.type === 'prompt' &&
         skill.paths &&
@@ -881,18 +982,99 @@ export const getSkillDirCommands = memoize(
     }
 
     logForDebugging(
-      `Loaded ${deduplicatedSkills.length} unique skills (${unconditionalSkills.length} unconditional, ${newConditionalSkills.length} conditional, managed: ${managedSkills.length}, user: ${userSkills.length}, project: ${projectSkillsNested.flat().length}, additional: ${additionalSkillsNested.flat().length}, legacy commands: ${legacyCommands.length})`,
+      `Loaded ${resolvedSkills.length} unique skills (${unconditionalSkills.length} unconditional, ${newConditionalSkills.length} conditional, managed: ${managedSkills.length}, user: ${userSkills.length}, project: ${projectSkillsNested.flat().length}, additional: ${additionalSkillsNested.flat().length}, legacy commands: ${legacyCommands.length}, sibling homes: ${siblingSkillCount})`,
     )
 
     return unconditionalSkills
   },
 )
 
+/**
+ * Logs one summary line for the sibling skills homes and returns how many
+ * sibling skills survived de-duplication.
+ */
+function logSiblingSkillHomes(
+  homes: ResolvedSiblingSkillsHome[],
+  userSkillsEnabled: boolean,
+  foundCounts: number[],
+  resolvedSkills: Command[],
+): number {
+  const loadedByHome = new Map<SiblingSkillsHomeId, number>()
+  for (const skill of resolvedSkills) {
+    const homeId = getSiblingSkillsHomeId(skill)
+    if (homeId) loadedByHome.set(homeId, (loadedByHome.get(homeId) ?? 0) + 1)
+  }
+
+  let enabledIndex = 0
+  const parts = homes.map(home => {
+    const displayPath = getSiblingSkillsHomeDisplayPath(home)
+    if (!userSkillsEnabled) return `${displayPath} skipped (user skills disabled)`
+    if (!home.enabled) return `${displayPath} disabled`
+    const found = foundCounts[enabledIndex++] ?? 0
+    const loaded = loadedByHome.get(home.id) ?? 0
+    return `${displayPath} ${loaded} loaded (${found - loaded} shadowed or duplicate)`
+  })
+  logForDebugging(`[skills] sibling homes: ${parts.join('; ')}`)
+
+  let total = 0
+  for (const count of loadedByHome.values()) total += count
+  return total
+}
+
+/** The same source eligibility governs discovery and filesystem subscriptions. */
+export function getEnabledSiblingSkillsHomes(
+  homes: ResolvedSiblingSkillsHome[] = resolveSiblingSkillsHomes(),
+): ResolvedSiblingSkillsHome[] {
+  if (
+    isBareMode() ||
+    isRestrictedToPluginOnly('skills') ||
+    !isSettingSourceEnabled('userSettings')
+  ) {
+    return []
+  }
+  return homes.filter(home => home.enabled)
+}
+
+/**
+ * Sibling skills homes that are switched off but hold skills, for the hint in
+ * /skills and `openclaude skills list`. Homes the user cannot enable from
+ * /config (skills locked to plugins, user settings disabled, or the setting
+ * pinned by managed, `--settings`, or local settings) are left out because the
+ * hint would be misleading.
+ */
+export async function getUnloadedSiblingSkillHomes(
+  homes: ResolvedSiblingSkillsHome[] = resolveSiblingSkillsHomes(),
+): Promise<Array<{ home: ResolvedSiblingSkillsHome; count: number }>> {
+  if (
+    isBareMode() ||
+    isRestrictedToPluginOnly('skills') ||
+    !isSettingSourceEnabled('userSettings')
+  ) {
+    return []
+  }
+  const counts = await Promise.all(
+    homes
+      .filter(home => !home.enabled && !home.pinnedBy)
+      .map(async home => ({
+        home,
+        count: (await findSkillMarkdownFiles(home.path)).length,
+      })),
+  )
+  return counts.filter(({ count }) => count > 0)
+}
+
 export function clearSkillCaches() {
+  siblingScanGeneration++
   getSkillDirCommands.cache?.clear?.()
   loadMarkdownFilesForSubdir.cache?.clear?.()
   conditionalSkills.clear()
   activatedConditionalSkillNames.clear()
+  // Activated siblings live in the dynamic map too. Reload them from their
+  // source so disabling, editing, or deleting a home cannot retain old skills.
+  // Nested OpenClaude skills keep their existing session lifetime.
+  for (const [name, skill] of dynamicSkills) {
+    if (getSiblingSkillsHomeId(skill)) dynamicSkills.delete(name)
+  }
 }
 
 // Backwards-compatible aliases for tests
@@ -959,30 +1141,30 @@ export async function discoverSkillDirsForPaths(
     // CWD-level skills are already loaded at startup, so we only discover nested ones
     // Use prefix+separator check to avoid matching /project-backup when cwd is /project
     while (currentDir.startsWith(resolvedCwd + pathSep)) {
-      const skillDir = join(currentDir, '.claude', 'skills')
-
-      // Skip if we've already checked this path (hit or miss) — avoids
-      // repeating the same failed stat on every Read/Write/Edit call when
-      // the directory doesn't exist (the common case).
-      if (!dynamicSkillDirs.has(skillDir)) {
-        dynamicSkillDirs.add(skillDir)
-        try {
-          await fs.stat(skillDir)
-          // Skills dir exists. Before loading, check if the containing dir
-          // is gitignored — blocks e.g. node_modules/pkg/.claude/skills from
-          // loading silently. `git check-ignore` handles nested .gitignore,
-          // .git/info/exclude, and global gitignore. Fails open outside a
-          // git repo (exit 128 → false); the invocation-time trust dialog
-          // is the actual security boundary.
-          if (await isPathGitignored(currentDir, resolvedCwd)) {
-            logForDebugging(
-              `[skills] Skipped gitignored skills dir: ${skillDir}`,
-            )
-            continue
+      for (const skillDir of getProjectSkillsPaths(currentDir)) {
+        // Skip if we've already checked this path (hit or miss) — avoids
+        // repeating the same failed stat on every Read/Write/Edit call when
+        // the directory doesn't exist (the common case).
+        if (!dynamicSkillDirs.has(skillDir)) {
+          dynamicSkillDirs.add(skillDir)
+          try {
+            await fs.stat(skillDir)
+            // Skills dir exists. Before loading, check if the containing dir
+            // is gitignored — blocks e.g. node_modules/pkg/.openclaude/skills from
+            // loading silently. `git check-ignore` handles nested .gitignore,
+            // .git/info/exclude, and global gitignore. Fails open outside a
+            // git repo (exit 128 → false); the invocation-time trust dialog
+            // is the actual security boundary.
+            if (await isPathGitignored(currentDir, resolvedCwd)) {
+              logForDebugging(
+                `[skills] Skipped gitignored skills dir: ${skillDir}`,
+              )
+              continue
+            }
+            newDirs.push(skillDir)
+          } catch {
+            // Directory doesn't exist — already recorded above, continue
           }
-          newDirs.push(skillDir)
-        } catch {
-          // Directory doesn't exist — already recorded above, continue
         }
       }
 
@@ -994,9 +1176,7 @@ export async function discoverSkillDirsForPaths(
   }
 
   // Sort by path depth (deepest first) so skills closer to the file take precedence
-  return newDirs.sort(
-    (a, b) => b.split(pathSep).length - a.split(pathSep).length,
-  )
+  return newDirs.sort(compareSkillDirPrecedence)
 }
 
 /**
@@ -1090,6 +1270,15 @@ export function activateConditionalSkillsForPaths(
   const activated: string[] = []
 
   for (const [name, skill] of conditionalSkills) {
+    const existing = dynamicSkills.get(name)
+    if (
+      getSiblingSkillsHomeId(skill) &&
+      existing &&
+      !getSiblingSkillsHomeId(existing)
+    ) {
+      conditionalSkills.delete(name)
+      continue
+    }
     if (skill.type !== 'prompt' || !skill.paths || skill.paths.length === 0) {
       continue
     }

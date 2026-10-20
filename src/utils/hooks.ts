@@ -120,6 +120,7 @@ import type {
   SkillHookMatcher,
 } from './settings/types.js'
 import { getHookDisplayText } from './hooks/hooksSettings.js'
+import { getWindowsBashHookCommand } from './hooks/windowsBashCommand.js'
 import { logForDebugging } from './debug.js'
 import { logForDiagnosticsNoPII } from './diagLogs.js'
 import { firstLineOf } from './stringUtils.js'
@@ -163,6 +164,7 @@ import {
 } from './hooks/sessionHooks.js'
 import type { AppState } from '../state/AppState.js'
 import { jsonStringify, jsonParse } from './slowOperations.js'
+import { stableStringifyJson } from './stableStringify.js'
 import { isEnvTruthy } from './envUtils.js'
 import { errorMessage, getErrnoCode } from './errors.js'
 import { getAgentName, getTeamName, getTeammateColor } from './teammate.js'
@@ -175,6 +177,39 @@ import type {
 
 const TOOL_HOOK_EXECUTION_TIMEOUT_MS = 10 * 60 * 1000
 
+function dedupeRegisteredPluginHooks(
+  registeredHooks: Array<HookCallbackMatcher | PluginHookMatcher>,
+): Array<HookCallbackMatcher | PluginHookMatcher> {
+  const seenPluginMatchers = new Set<string>()
+  const deduped: Array<HookCallbackMatcher | PluginHookMatcher> = []
+
+  for (const matcher of registeredHooks) {
+    // SDK callback hooks are intentionally not deduped. Their callbacks are
+    // runtime values, so structural comparison would be lossy and unsafe.
+    if (!('pluginRoot' in matcher)) {
+      deduped.push(matcher)
+      continue
+    }
+
+    const pluginMatcherKey = stableStringifyJson({
+      pluginId: matcher.pluginId,
+      pluginName: matcher.pluginName,
+      pluginRoot: matcher.pluginRoot,
+      matcher: matcher.matcher ?? null,
+      hooks: matcher.hooks,
+    })
+
+    if (seenPluginMatchers.has(pluginMatcherKey)) {
+      continue
+    }
+
+    seenPluginMatchers.add(pluginMatcherKey)
+    deduped.push(matcher)
+  }
+
+  return deduped
+}
+
 function normalizeFallbackAgentModel(
   model: string | undefined,
 ): 'sonnet' | 'opus' | 'haiku' | undefined {
@@ -182,6 +217,25 @@ function normalizeFallbackAgentModel(
     return model
   }
   return undefined
+}
+
+const fallbackAgentLaunchSuccessStatuses = [
+  'async_launched',
+  'completed',
+  'teammate_spawned',
+] as const
+type FallbackAgentLaunchSuccessStatus =
+  (typeof fallbackAgentLaunchSuccessStatuses)[number]
+const fallbackAgentLaunchSuccessStatusSet = new Set<string>(
+  fallbackAgentLaunchSuccessStatuses,
+)
+
+export function isFallbackAgentLaunchSuccessStatus(
+  status: unknown,
+): status is FallbackAgentLaunchSuccessStatus {
+  return (
+    typeof status === 'string' && fallbackAgentLaunchSuccessStatusSet.has(status)
+  )
 }
 
 async function launchFallbackAgentFromHookChains(
@@ -214,12 +268,7 @@ async function launchFallbackAgentFromHookChains(
       | undefined
     const status = data?.status
 
-    if (
-      status === 'async_launched' ||
-      status === 'completed' ||
-      status === 'remote_launched' ||
-      status === 'teammate_spawned'
-    ) {
+    if (isFallbackAgentLaunchSuccessStatus(status)) {
       return {
         launched: true,
         agentId: data?.agentId ?? data?.agent_id,
@@ -1000,10 +1049,8 @@ async function execCommandHook(
   // On Windows (bash only), auto-prepend `bash` for .sh scripts so they
   // execute instead of opening in the default file handler. PowerShell
   // runs .ps1 files natively — no prepend needed.
-  if (isWindows && !isPowerShell && command.trim().match(/\.sh(\s|$|")/)) {
-    if (!command.trim().startsWith('bash ')) {
-      command = `bash ${command}`
-    }
+  if (isWindows && !isPowerShell) {
+    command = getWindowsBashHookCommand(command)
   }
 
   // CLAUDE_CODE_SHELL_PREFIX wraps the command via POSIX quoting
@@ -1127,7 +1174,15 @@ async function execCommandHook(
   // Hooks use pipe mode — stdout must be streamed into JS so we can parse
   // the first response line to detect async hooks ({"async": true}).
   const hookTaskOutput = new TaskOutput(`hook_${child.pid}`, null)
-  const shellCommand = wrapSpawn(child, signal, hookTimeoutMs, hookTaskOutput)
+  const shellCommand = wrapSpawn(
+    child,
+    signal,
+    hookTimeoutMs,
+    hookTaskOutput,
+    false,
+    undefined,
+    { keepAliveOnInterrupt: hook.asyncRewake === true },
+  )
   // Track whether shellCommand ownership was transferred (e.g., to async hook registry)
   let shellCommandTransferred = false
   // Track whether stdin has already been written (to avoid "write after end" errors)
@@ -1349,10 +1404,15 @@ async function execCommandHook(
         })
         // Explicitly specify UTF-8 encoding to ensure proper handling of Unicode characters
         child.stdin.write(jsonInput + '\n', 'utf8')
-        // When requestPrompt is provided, keep stdin open for prompt responses
-        if (!requestPrompt) {
-          child.stdin.end()
-        }
+        // Always close stdin after writing the initial JSON payload. The Anthropic
+        // hook input contract (https://docs.claude.com/en/docs/claude-code/hooks#hook-input)
+        // states stdin is closed after the payload is sent, and every plugin written
+        // against that spec reads stdin until EOF. Leaving stdin open to support
+        // future prompt-response on the same channel caused every UserPromptSubmit
+        // hook to block for the full per-hook timeout (default 60s) on every user
+        // message in interactive mode, since requestPrompt is truthy whenever the
+        // REPL is mounted. See issue #825 for the full analysis.
+        child.stdin.end()
         resolve()
       })
 
@@ -1659,7 +1719,7 @@ function getHooksConfig(
   // Process registered hooks (SDK callbacks and plugin native hooks)
   const registeredHooks = getRegisteredHooks()?.[hookEvent]
   if (registeredHooks) {
-    for (const matcher of registeredHooks) {
+    for (const matcher of dedupeRegisteredPluginHooks(registeredHooks)) {
       // Skip plugin hooks when restricted to managed hooks only
       // Plugin hooks have pluginRoot set, SDK callbacks do not
       if (managedOnly && 'pluginRoot' in matcher) {
@@ -4803,7 +4863,9 @@ export async function executeStatusLineCommand(
   }
 
   // Use provided signal or create a default one
-  const abortSignal = signal || AbortSignal.timeout(timeoutMs)
+  const { signal: abortSignal, cleanup } = signal
+    ? { signal, cleanup: () => {} }
+    : createCombinedAbortSignal(undefined, { timeoutMs })
 
   try {
     // Convert status input to JSON
@@ -4850,6 +4912,8 @@ export async function executeStatusLineCommand(
   } catch (error) {
     logForDebugging(`Status hook failed: ${error}`, { level: 'error' })
     return undefined
+  } finally {
+    cleanup()
   }
 }
 
@@ -4893,7 +4957,9 @@ export async function executeFileSuggestionCommand(
   }
 
   // Use provided signal or create a default one
-  const abortSignal = signal || AbortSignal.timeout(timeoutMs)
+  const { signal: abortSignal, cleanup } = signal
+    ? { signal, cleanup: () => {} }
+    : createCombinedAbortSignal(undefined, { timeoutMs })
 
   try {
     const jsonInput = jsonStringify(fileSuggestionInput)
@@ -4922,6 +4988,8 @@ export async function executeFileSuggestionCommand(
       level: 'error',
     })
     return []
+  } finally {
+    cleanup()
   }
 }
 
@@ -5115,9 +5183,11 @@ export function hasWorktreeCreateHook(): boolean {
  */
 export async function executeWorktreeCreateHook(
   name: string,
+  options?: { cwd?: string },
 ): Promise<{ worktreePath: string }> {
   const hookInput = {
     ...createBaseHookInput(undefined),
+    ...(options?.cwd ? { cwd: options.cwd } : {}),
     hook_event_name: 'WorktreeCreate' as const,
     name,
   }

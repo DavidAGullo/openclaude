@@ -14,6 +14,7 @@ import { execFileNoThrowWithCwd } from './execFileNoThrow.js'
 import { getFsImplementation } from './fsOperations.js'
 import {
   detectImageFormatFromBase64,
+  ImageResizeError,
   type ImageDimensions,
   maybeResizeAndDownsampleImageBuffer,
 } from './imageResizer.js'
@@ -37,6 +38,18 @@ export const LINUX_CLIPBOARD_IMAGE_MIME_TYPES = [
   'image/webp',
   'image/bmp',
 ]
+
+// Shared PowerShell command to check if the Windows clipboard contains an image.
+// Uses System.Windows.Forms.Clipboard.ContainsImage() which properly detects
+// raw bitmap data (CF_DIB/CF_BITMAP) from screenshot tools like PrintScreen
+// and Win+Shift+S, unlike Get-Clipboard -Format Image which only works with
+// file references copied from Explorer.
+const WIN32_CLIPBOARD_HAS_IMAGE_CMD =
+  'Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::ContainsImage()'
+
+function escapePowerShellSingleQuotedString(value: string): string {
+  return value.replace(/'/g, "''")
+}
 
 export function buildLinuxClipboardCheckCommand(): string {
   const mimePattern = LINUX_CLIPBOARD_IMAGE_MIME_TYPES.map(mimeType =>
@@ -94,9 +107,8 @@ function getClipboardCommands() {
       deleteFile: `rm -f "${screenshotPath}"`,
     },
     win32: {
-      checkImage:
-        'powershell -NoProfile -Command "(Get-Clipboard -Format Image) -ne $null"',
-      saveImage: `powershell -NoProfile -Command "$img = Get-Clipboard -Format Image; if ($img) { $img.Save('${screenshotPath.replace(/\\/g, '\\\\')}', [System.Drawing.Imaging.ImageFormat]::Png) }"`,
+      checkImage: `powershell -NoProfile -Command "${WIN32_CLIPBOARD_HAS_IMAGE_CMD}"`,
+      saveImage: `powershell -NoProfile -Command "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Windows.Forms; $img = [System.Windows.Forms.Clipboard]::GetImage(); if (-not $img) { exit 1 }; $img.Save('${escapePowerShellSingleQuotedString(screenshotPath)}', [System.Drawing.Imaging.ImageFormat]::Png)"`,
       getPath: 'powershell -NoProfile -Command "Get-Clipboard"',
       deleteFile: `del /f "${screenshotPath}"`,
     },
@@ -114,10 +126,101 @@ export type ImageWithDimensions = {
   dimensions?: ImageDimensions
 }
 
+export const CLIPBOARD_IMAGE_PASTE_FAILURE_KEY = 'image-paste-failed'
+export const CLIPBOARD_IMAGE_PASTE_GENERIC_ERROR =
+  'Unable to paste image from clipboard.'
+
+/**
+ * User-facing text for a clipboard image paste that found bytes but could
+ * not attach them. Resize/API-limit failures keep their message so Alt+V
+ * does not collapse to "No image found".
+ */
+export function formatClipboardImagePasteError(error: unknown): string {
+  return error instanceof ImageResizeError
+    ? error.message
+    : CLIPBOARD_IMAGE_PASTE_GENERIC_ERROR
+}
+
+/**
+ * Callers without a notification UI (CustomSelect image paste) must still
+ * consume the rejection so it is not an unhandled promise.
+ */
+export function logClipboardImagePasteRejection(error: unknown): void {
+  logError(error as Error)
+}
+
+/**
+ * Native NSPasteboard path and the osascript/PowerShell path share this:
+ * ImageResizeError is an admission failure, not "native reader unavailable".
+ */
+export function rethrowIfClipboardResizeError(error: unknown): void {
+  if (error instanceof ImageResizeError) {
+    throw error
+  }
+}
+
+export type NativeClipboardPng = {
+  png: Buffer
+  originalWidth: number
+  originalHeight: number
+  width: number
+  height: number
+}
+
+/**
+ * Apply the same 5MB size cap the osascript path uses after the native
+ * reader has already capped pixel dimensions. ImageResizeError propagates
+ * to the caller instead of being treated as a missing native module.
+ */
+export async function clipboardImageFromNativePng(
+  native: NativeClipboardPng,
+): Promise<ImageWithDimensions> {
+  const buffer: Buffer = native.png
+  if (buffer.length > IMAGE_TARGET_RAW_SIZE) {
+    const resized = await maybeResizeAndDownsampleImageBuffer(
+      buffer,
+      buffer.length,
+      'png',
+    )
+    return {
+      base64: resized.buffer.toString('base64'),
+      mediaType: `image/${resized.mediaType}`,
+      dimensions: {
+        originalWidth: native.originalWidth,
+        originalHeight: native.originalHeight,
+        displayWidth: resized.dimensions?.displayWidth ?? native.width,
+        displayHeight: resized.dimensions?.displayHeight ?? native.height,
+      },
+    }
+  }
+  return {
+    base64: buffer.toString('base64'),
+    mediaType: 'image/png',
+    dimensions: {
+      originalWidth: native.originalWidth,
+      originalHeight: native.originalHeight,
+      displayWidth: native.width,
+      displayHeight: native.height,
+    },
+  }
+}
+
 /**
  * Check if clipboard contains an image without retrieving it.
  */
 export async function hasImageInClipboard(): Promise<boolean> {
+  // Windows: use .NET Clipboard.ContainsImage() which properly detects
+  // raw bitmap data (CF_DIB/CF_BITMAP) from screenshot tools like
+  // PrintScreen and Win+Shift+S.
+  if (process.platform === 'win32') {
+    const result = await execFileNoThrowWithCwd('powershell', [
+      '-NoProfile',
+      '-Command',
+      WIN32_CLIPBOARD_HAS_IMAGE_CMD,
+    ])
+    return result.code === 0 && result.stdout.trim() === 'True'
+  }
+
   if (process.platform !== 'darwin') {
     return false
   }
@@ -167,56 +270,27 @@ export async function getImageFromClipboard(): Promise<ImageWithDimensions | nul
       if (!native) {
         return null
       }
-      // The native path caps dimensions but not file size. A complex
-      // 2000×2000 PNG can still exceed the 3.75MB raw / 5MB base64 API
-      // limit — for that edge case, run through the same size-cap that
-      // the osascript path uses (degrades to JPEG if needed). Cheap if
-      // already under: just a sharp metadata read.
-      const buffer: Buffer = native.png
-      if (buffer.length > IMAGE_TARGET_RAW_SIZE) {
-        const resized = await maybeResizeAndDownsampleImageBuffer(
-          buffer,
-          buffer.length,
-          'png',
-        )
-        return {
-          base64: resized.buffer.toString('base64'),
-          mediaType: `image/${resized.mediaType}`,
-          // resized.dimensions sees the already-downsampled buffer; native knows the true originals.
-          dimensions: {
-            originalWidth: native.originalWidth,
-            originalHeight: native.originalHeight,
-            displayWidth: resized.dimensions?.displayWidth ?? native.width,
-            displayHeight: resized.dimensions?.displayHeight ?? native.height,
-          },
-        }
-      }
-      return {
-        base64: buffer.toString('base64'),
-        mediaType: 'image/png',
-        dimensions: {
-          originalWidth: native.originalWidth,
-          originalHeight: native.originalHeight,
-          displayWidth: native.width,
-          displayHeight: native.height,
-        },
-      }
+      return await clipboardImageFromNativePng(native)
     } catch (e) {
+      rethrowIfClipboardResizeError(e)
       logError(e as Error)
       // Fall through to osascript fallback.
     }
   }
 
   const { commands, screenshotPath } = getClipboardCommands()
+  let screenshotSaved = false
   try {
-    // Check if clipboard has image
+    // Check if clipboard has image.
     const checkResult = await execa(commands.checkImage, {
       shell: true,
       reject: false,
     })
-    if (checkResult.exitCode !== 0) {
+    if (process.platform !== 'win32' && checkResult.exitCode !== 0) {
       return null
     }
+    // GetImage() and the saved PNG are authoritative. In particular, do not
+    // reject a raw Windows bitmap solely because the probe fails or says False.
 
     // Save the image
     const saveResult = await execa(commands.saveImage, {
@@ -226,6 +300,7 @@ export async function getImageFromClipboard(): Promise<ImageWithDimensions | nul
     if (saveResult.exitCode !== 0) {
       return null
     }
+    screenshotSaved = true
 
     // Read the image and convert to base64
     let imageBuffer = getFsImplementation().readFileBytesSync(screenshotPath)
@@ -252,16 +327,19 @@ export async function getImageFromClipboard(): Promise<ImageWithDimensions | nul
     // Detect format from magic bytes
     const mediaType = detectImageFormatFromBase64(base64Image)
 
-    // Cleanup (fire-and-forget, don't await)
-    void execa(commands.deleteFile, { shell: true, reject: false })
-
     return {
       base64: base64Image,
       mediaType,
       dimensions: resized.dimensions,
     }
-  } catch {
+  } catch (e) {
+    rethrowIfClipboardResizeError(e)
     return null
+  } finally {
+    if (screenshotSaved) {
+      // Cleanup every post-save exit, including resize/admission rejection.
+      void execa(commands.deleteFile, { shell: true, reject: false })
+    }
   }
 }
 

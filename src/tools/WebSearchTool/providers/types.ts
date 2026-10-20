@@ -29,6 +29,13 @@ export interface ProviderOutput {
   providerName: string
   /** Duration of the provider call in seconds */
   durationSeconds: number
+  /**
+   * In auto mode, continue to the next provider instead of returning this
+   * output — e.g. when client-side domain filtering removed every hit and a
+   * later backend may honor the filter server-side. Explicit modes return
+   * the output as-is.
+   */
+  fallbackInAuto?: boolean
 }
 
 export interface SearchProvider {
@@ -53,15 +60,18 @@ const SOURCE_KEYS = [
   'source', 'domain', 'displayLink', 'displayed_link', 'engine',
 ] as const
 
-function firstMatch(obj: any, keys: readonly string[]): string | undefined {
+function firstMatch(obj: unknown, keys: readonly string[]): string | undefined {
+  if (!obj || typeof obj !== 'object') return undefined
+  const record = obj as Record<string, unknown>
   for (const k of keys) {
-    if (typeof obj?.[k] === 'string' && obj[k]) return obj[k]
+    const v = record[k]
+    if (typeof v === 'string' && v) return v
   }
   return undefined
 }
 
 /** Extract a SearchHit from any object shape using well-known field aliases. */
-export function normalizeHit(raw: any): SearchHit | null {
+export function normalizeHit(raw: unknown): SearchHit | null {
   if (!raw || typeof raw !== 'object') return null
   const title = firstMatch(raw, TITLE_KEYS)
   const url = firstMatch(raw, URL_KEYS)
@@ -90,9 +100,18 @@ export function safeHostname(url: string | undefined): string | undefined {
  *          hostMatchesDomain('badexample.com', 'example.com') → false
  */
 export function hostMatchesDomain(host: string, domain: string): boolean {
-  if (host === domain) return true
+  // `host` arrives already lowercased (WHATWG `new URL().hostname` via
+  // safeHostname), but `domain` comes straight from the caller's
+  // allowed_domains / blocked_domains and is never normalized. Lowercase both
+  // so a capitalized entry like `Reddit.com` still matches `reddit.com` — hosts
+  // are case-insensitive, and without this `blocked_domains: ['Reddit.com']`
+  // silently fails to block and `allowed_domains: ['GitHub.com']` drops every
+  // legitimate hit.
+  const normalizedHost = host.toLowerCase()
+  const normalizedDomain = domain.toLowerCase()
+  if (normalizedHost === normalizedDomain) return true
   // Subdomain: must end with `.domain` (not just `domain`)
-  return host.endsWith('.' + domain)
+  return normalizedHost.endsWith('.' + normalizedDomain)
 }
 
 export function applyDomainFilters(

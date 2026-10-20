@@ -10,7 +10,10 @@ import {
   logEvent,
 } from 'src/services/analytics/index.js'
 import { getModelStrings } from 'src/utils/model/modelStrings.js'
-import { getAPIProvider } from 'src/utils/model/providers.js'
+import {
+  getAPIProvider,
+  isFirstPartyAnthropicBaseUrl,
+} from 'src/utils/model/providers.js'
 import {
   getIsNonInteractiveSession,
   preferThirdPartyAuthentication,
@@ -40,6 +43,7 @@ import {
   isValidAwsStsOutput,
 } from './aws.js'
 import { AwsAuthStatusManager } from './awsAuthStatusManager.js'
+import { importOptionalRuntimeModule } from './optionalRuntimeModule.js'
 import { clearBetasCaches } from './betas.js'
 import {
   type AccountInfo,
@@ -81,17 +85,15 @@ import { clearToolSchemaCache } from './toolSchemaCache.js'
 const DEFAULT_API_KEY_HELPER_TTL = 5 * 60 * 1000
 
 /**
- * CCR and Claude Desktop spawn the CLI with OAuth and should never fall back
- * to the user's ~/.claude/settings.json API-key config (apiKeyHelper,
- * env.ANTHROPIC_API_KEY, env.ANTHROPIC_AUTH_TOKEN). Those settings exist for
- * the user's terminal CLI, not managed sessions. Without this guard, a user
- * who runs `claude` in their terminal with an API key sees every CCD session
- * also use that key — and fail if it's stale/wrong-org.
+ * Managed launchers and the SSH auth proxy own the effective OAuth credential
+ * and must not inherit the user's terminal API-key configuration.
  */
-function isManagedOAuthContext(): boolean {
+export function isManagedOAuthContext(): boolean {
   return (
     isEnvTruthy(process.env.CLAUDE_CODE_REMOTE) ||
-    process.env.CLAUDE_CODE_ENTRYPOINT === 'claude-desktop'
+    process.env.CLAUDE_CODE_ENTRYPOINT === 'claude-desktop' ||
+    (!!process.env.ANTHROPIC_UNIX_SOCKET &&
+      !!process.env.CLAUDE_CODE_OAUTH_TOKEN)
   )
 }
 
@@ -130,10 +132,18 @@ export function isAnthropicAuthEnabled(): boolean {
     apiKeyHelper ||
     process.env.CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR
 
-  // Check if API key is from an external source (not managed by /login)
-  const { source: apiKeySource } = getAnthropicApiKeyWithSource({
-    skipRetrievingKeyFromApiKeyHelper: true,
-  })
+  // Check if API key is from an external source (not managed by /login).
+  // Predicate must not throw: getAnthropicApiKeyWithSource throws under
+  // CI/NODE_ENV=test when no key is configured, but here we just want to
+  // know the source — "no key" is a valid answer.
+  let apiKeySource: ApiKeySource
+  try {
+    ;({ source: apiKeySource } = getAnthropicApiKeyWithSource({
+      skipRetrievingKeyFromApiKeyHelper: true,
+    }))
+  } catch {
+    apiKeySource = 'none'
+  }
   const hasExternalApiKey =
     apiKeySource === 'ANTHROPIC_API_KEY' || apiKeySource === 'apiKeyHelper'
 
@@ -221,10 +231,17 @@ export function getAnthropicApiKey(): null | string {
 }
 
 export function hasAnthropicApiKeyAuth(): boolean {
-  const { key, source } = getAnthropicApiKeyWithSource({
-    skipRetrievingKeyFromApiKeyHelper: true,
-  })
-  return key !== null && source !== 'none'
+  // Predicate: never throw. getAnthropicApiKeyWithSource throws under
+  // CI/NODE_ENV=test when no key is configured — but "do we have auth?" is
+  // exactly the question that has to answer cleanly in that state.
+  try {
+    const { key, source } = getAnthropicApiKeyWithSource({
+      skipRetrievingKeyFromApiKeyHelper: true,
+    })
+    return key !== null && source !== 'none'
+  } catch {
+    return false
+  }
 }
 
 export function getAnthropicApiKeyWithSource(
@@ -852,8 +869,11 @@ const GCP_CREDENTIALS_CHECK_TIMEOUT_MS = 5_000
  */
 export async function checkGcpCredentialsValid(): Promise<boolean> {
   try {
-    // Dynamically import to avoid loading google-auth-library unnecessarily
-    const { GoogleAuth } = await import('google-auth-library')
+    // Dynamically import to avoid loading google-auth-library unnecessarily.
+    // It is an optional, on-demand dependency (not shipped by default).
+    const { GoogleAuth } = await importOptionalRuntimeModule<
+      typeof import('google-auth-library')
+    >('google-auth-library', 'Vertex AI (GCP) authentication')
     const auth = new GoogleAuth({
       scopes: ['https://www.googleapis.com/auth/cloud-platform'],
     })
@@ -1567,7 +1587,28 @@ async function checkAndRefreshOAuthTokenIfNeededImpl(
   }
 }
 
+/**
+ * Read subscriptionType only from user settings source.
+ * Project, local, flag, and policy settings are excluded.
+ * See jatmn's P1 on #1731.
+ */
+function getTrustedSubscriptionType(): SubscriptionType | null {
+  const candidate = getSettingsForSource('userSettings')?.subscriptionType
+  if (candidate) {
+    return candidate as SubscriptionType
+  }
+  return null
+}
+
 export function isClaudeAISubscriber(): boolean {
+  const override = getTrustedSubscriptionType()
+  if (override === 'free') {
+    return false
+  }
+  if (override) {
+    return true
+  }
+
   if (!isAnthropicAuthEnabled()) {
     return false
   }
@@ -1669,6 +1710,11 @@ export function getSubscriptionType(): SubscriptionType | null {
   // Check for mock subscription type first (ANT-only testing)
   if (shouldUseMockSubscription()) {
     return getMockSubscriptionType()
+  }
+
+  const override = getTrustedSubscriptionType()
+  if (override) {
+    return override
   }
 
   if (!isAnthropicAuthEnabled()) {
@@ -1873,7 +1919,7 @@ export type UserAccountInfo = {
 export function getAccountInformation() {
   const apiProvider = getAPIProvider()
   // Only provide account info for first-party Anthropic API
-  if (apiProvider !== 'firstParty') {
+  if (apiProvider !== 'firstParty' || !isFirstPartyAnthropicBaseUrl()) {
     return undefined
   }
   const { source: authTokenSource } = getAuthTokenSource()
@@ -1974,8 +2020,8 @@ export async function validateForceLoginOrg(): Promise<OrgValidationResult> {
         `Unable to verify organization for the current authentication token.\n` +
         `This machine requires organization ${requiredOrgUuid} but the profile could not be fetched.\n` +
         `This may be a network error, or the token may lack the user:profile scope required for\n` +
-        `verification (tokens from 'claude setup-token' do not include this scope).\n` +
-        `Try again, or obtain a full-scope token via 'claude auth login'.`,
+        `verification (tokens from 'openclaude setup-token' do not include this scope).\n` +
+        `Try again, or obtain a full-scope token via 'openclaude auth login'.`,
     }
   }
 
@@ -2005,7 +2051,7 @@ export async function validateForceLoginOrg(): Promise<OrgValidationResult> {
     message:
       `Your authentication token belongs to organization ${tokenOrgUuid},\n` +
       `but this machine requires organization ${requiredOrgUuid}.\n\n` +
-      `Please log in with the correct organization: claude auth login`,
+      `Please log in with the correct organization: openclaude auth login`,
   }
 }
 

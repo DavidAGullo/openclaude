@@ -4,6 +4,7 @@ import type { CanUseToolFn } from '../hooks/useCanUseTool.js'
 import type { CompactionResult } from '../services/compact/compact.js'
 import type { ScopedMcpServerConfig } from '../services/mcp/types.js'
 import type { ToolUseContext } from '../Tool.js'
+import type { AgentDefinition } from '../tools/AgentTool/loadAgentsDir.js'
 import type { EffortValue } from '../utils/effort.js'
 import type { IDEExtensionInstallationStatus, IdeType } from '../utils/ide.js'
 import type { SettingSource } from '../utils/settings/constants.js'
@@ -12,15 +13,30 @@ import type { ThemeName } from '../utils/theme.js'
 import type { LogOption } from './logs.js'
 import type { Message } from './message.js'
 import type { PluginManifest } from './plugin.js'
+import type { LocalizationKey } from '../i18n/types.js'
 
 export type LocalCommandResult =
-  | { type: 'text'; value: string }
+  | {
+      type: 'text'
+      value: string
+      display?: 'skip'
+      shouldQuery?: boolean
+      metaMessages?: string[]
+      nextInput?: string
+      submitNextInput?: boolean
+    }
   | {
       type: 'compact'
       compactionResult: CompactionResult
       displayText?: string
+      nextInput?: string
+      submitNextInput?: boolean
     }
-  | { type: 'skip' } // Skip messages
+  | {
+      type: 'skip'
+      nextInput?: string
+      submitNextInput?: boolean
+    } // Skip messages
 
 export type PromptCommand = {
   type: 'prompt'
@@ -39,6 +55,15 @@ export type PromptCommand = {
   hooks?: HooksSettings
   // Base directory for skill resources (used to set CLAUDE_PLUGIN_ROOT environment variable for skill hooks)
   skillRoot?: string
+  // Source markdown file for disk-backed skills. Used by CLI inspection
+  // commands so showing a skill never has to invoke it.
+  skillFilePath?: string
+  // Trust metadata loaded from installed skill.json files, when present.
+  skillTrust?: string
+  // Set when the skill was discovered read-only in another agent's skills
+  // home (~/.agents/skills or ~/.claude/skills). These skills rank below
+  // every OpenClaude-owned skill and command.
+  siblingSkillsHome?: 'agents' | 'claude-code'
   // Execution context: 'inline' (default) or 'fork' (run as sub-agent)
   // 'inline' = skill content expands into the current conversation
   // 'fork' = skill runs in a sub-agent with separate context and token budget
@@ -90,6 +115,7 @@ export type LocalJSXCommandContext = ToolUseContext & {
     config: Record<string, ScopedMcpServerConfig>,
   ) => void
   onInstallIDEExtension?: (ide: IdeType) => void
+  setActiveSessionAgent?: (agent: AgentDefinition) => void
   resume?: (
     sessionId: UUID,
     log: LogOption,
@@ -175,6 +201,7 @@ export type CommandAvailability =
 export type CommandBase = {
   availability?: CommandAvailability[]
   description: string
+  localizationKey?: LocalizationKey
   hasUserSpecifiedDescription?: boolean
   /** Defaults to true. Only set when the command has conditional enablement (feature flags, env checks, etc). */
   isEnabled?: () => boolean
@@ -185,6 +212,7 @@ export type CommandBase = {
   isMcp?: boolean
   argumentHint?: string // Hint text for command arguments (displayed in gray after command)
   whenToUse?: string // From the "Skill" spec. Detailed usage scenarios for when to use this command
+  whenToUseLocalizationKey?: LocalizationKey
   version?: string // Version of the command/skill
   disableModelInvocation?: boolean // Whether to disable this command from being invoked by models
   userInvocable?: boolean // Whether users can invoke this skill by typing /skill-name
@@ -205,12 +233,29 @@ export type CommandBase = {
 export type Command = CommandBase &
   (PromptCommand | LocalCommand | LocalJSXCommand)
 
+/** Runtime guard for values that are allowed into command registries. */
+export function isCommand(value: unknown): value is Command {
+  if (typeof value !== 'object' || value === null) return false
+
+  const maybeCommand = value as {
+    name?: unknown
+    type?: unknown
+  }
+
+  return (
+    typeof maybeCommand.name === 'string' &&
+    (maybeCommand.type === 'prompt' ||
+      maybeCommand.type === 'local' ||
+      maybeCommand.type === 'local-jsx')
+  )
+}
+
 /** Resolves the user-visible name, falling back to `cmd.name` when not overridden. */
 export function getCommandName(cmd: CommandBase): string {
   return cmd.userFacingName?.() ?? cmd.name
 }
 
 /** Resolves whether the command is enabled, defaulting to true. */
-export function isCommandEnabled(cmd: CommandBase): boolean {
-  return cmd.isEnabled?.() ?? true
+export function isCommandEnabled(cmd: CommandBase | null | undefined): boolean {
+  return cmd?.isEnabled?.() ?? true
 }

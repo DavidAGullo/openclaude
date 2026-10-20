@@ -2,7 +2,7 @@ import { PassThrough } from 'node:stream'
 
 import { expect, test } from 'bun:test'
 import React from 'react'
-import stripAnsi from 'strip-ansi'
+import { stripVTControlCharacters as stripAnsi } from 'node:util'
 
 import { AppStateProvider } from '../state/AppState.js'
 import { createRoot } from '../ink.js'
@@ -87,13 +87,34 @@ async function renderFrame(node: React.ReactNode): Promise<string> {
     </AppStateProvider>,
   )
 
-  await Bun.sleep(50)
-  root.unmount()
-  stdin.end()
-  stdout.end()
-  await Bun.sleep(25)
+  try {
+    return await waitForOutput(
+      getOutput,
+      output => output.includes('Select login method:') || output.includes('Set up provider'),
+    )
+  } finally {
+    root.unmount()
+    stdin.end()
+    stdout.end()
+  }
+}
 
-  return stripAnsi(extractLastFrame(getOutput()))
+async function waitForOutput(
+  getOutput: () => string,
+  predicate: (output: string) => boolean,
+  timeoutMs = 2500,
+): Promise<string> {
+  const startedAt = Date.now()
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const output = stripAnsi(extractLastFrame(getOutput()))
+    if (predicate(output)) {
+      return output
+    }
+    await Bun.sleep(10)
+  }
+
+  throw new Error('Timed out waiting for ConsoleOAuthFlow test output')
 }
 
 test('login picker shows the third-party platform option', async () => {
@@ -112,10 +133,13 @@ test('third-party provider branch opens the first-run provider manager', async (
   )
 
   expect(output).toContain('Set up provider')
-  // Use alphabetically-early sentinels so they remain visible in the
-  // 13-row test frame after the provider list was sorted A→Z.
+  // Keep the sentinels near the top of the preset list so adding another
+  // provider does not push the assertion outside the 13-row test frame.
+  expect(output).toContain('aimlapi.com')
   expect(output).toContain('Anthropic')
   expect(output).toContain('Azure OpenAI')
-  expect(output).toContain('DeepSeek')
-  expect(output).toContain('Google Gemini')
+  expect(output).toContain('Command Code')
+  // The Cloudflare Workers AI preset must be offered in the first-run picker
+  // (it sorts ahead of DeepSeek, so it is within the visible frame).
+  expect(output).toContain('Cloudflare Workers AI')
 })

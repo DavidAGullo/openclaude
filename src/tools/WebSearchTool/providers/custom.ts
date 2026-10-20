@@ -27,6 +27,7 @@
  */
 
 import type { SearchInput, SearchProvider } from './types.js'
+import { createCombinedAbortSignal } from '../../../utils/combinedAbortSignal.js'
 import {
   applyDomainFilters,
   normalizeHit,
@@ -46,7 +47,19 @@ interface ProviderPreset {
   authHeader?: string
   authScheme?: string
   jsonPath?: string
-  responseAdapter?: (data: any) => SearchHit[]
+  responseAdapter?: (data: unknown) => SearchHit[]
+  /**
+   * When set, the API key (WEB_KEY) is sent as this query parameter instead
+   * of in an HTTP header. Auth headers are suppressed automatically unless
+   * WEB_AUTH_HEADER is explicitly set by the user.
+   */
+  authQueryParam?: string
+  /**
+   * Additional query params sourced from environment variables.
+   * Format: { paramName: ENV_VAR_NAME } (e.g. { cx: 'GOOGLE_CSE_ID' }).
+   * The named env var must be set or the request fails fast with a clear error.
+   */
+  envQueryParams?: Record<string, string>
 }
 
 const BUILT_IN_PROVIDERS: Record<string, ProviderPreset> = {
@@ -57,40 +70,73 @@ const BUILT_IN_PROVIDERS: Record<string, ProviderPreset> = {
     urlTemplate: 'https://localhost:8080/search',
     queryParam: 'q',
     jsonPath: 'results',
-    responseAdapter(data: any) {
-      return (data.results ?? []).map((r: any) => ({
-        title: r.title ?? r.url,
-        url: r.url,
-        description: r.content,
-        source: r.engine ?? r.source,
-      }))
+    responseAdapter(data: unknown) {
+      const rec = (data ?? {}) as Record<string, unknown>
+      const rawResults = Array.isArray(rec.results) ? rec.results : []
+      return (rawResults as unknown[]).map((r) => {
+        const item = (r ?? {}) as Record<string, unknown>
+        const url = typeof item.url === 'string' ? item.url : ''
+        return {
+          title: typeof item.title === 'string' ? item.title : url,
+          url,
+          description: typeof item.content === 'string' ? item.content : undefined,
+          source:
+            typeof item.engine === 'string'
+              ? item.engine
+              : typeof item.source === 'string'
+                ? item.source
+                : undefined,
+        }
+      })
     },
   },
   google: {
+    // Google Custom Search JSON API requires both `key` (API key) and
+    // `cx` (Programmable Search Engine ID) as query parameters. There is
+    // no Bearer-token auth path. Set WEB_KEY=<api-key> and
+    // GOOGLE_CSE_ID=<engine-id>.
+    //
+    // ⚠️  Google has announced this API will be discontinued on 2027-01-01
+    // and is closed to new customers. Prefer Brave/Tavily/Exa where possible.
     urlTemplate: 'https://www.googleapis.com/customsearch/v1',
     queryParam: 'q',
-    authHeader: 'Authorization',
-    authScheme: 'Bearer',
-    responseAdapter(data: any) {
-      return (data.items ?? []).map((r: any) => ({
-        title: r.title ?? '',
-        url: r.link ?? '',
-        description: r.snippet,
-        source: r.displayLink,
-      }))
+    authQueryParam: 'key',
+    envQueryParams: { cx: 'GOOGLE_CSE_ID' },
+    responseAdapter(data: unknown) {
+      const rec = (data ?? {}) as Record<string, unknown>
+      const rawItems = Array.isArray(rec.items) ? rec.items : []
+      return (rawItems as unknown[]).map((r) => {
+        const item = (r ?? {}) as Record<string, unknown>
+        return {
+          title: typeof item.title === 'string' ? item.title : '',
+          url: typeof item.link === 'string' ? item.link : '',
+          description: typeof item.snippet === 'string' ? item.snippet : undefined,
+          source: typeof item.displayLink === 'string' ? item.displayLink : undefined,
+        }
+      })
     },
   },
   brave: {
     urlTemplate: 'https://api.search.brave.com/res/v1/web/search',
     queryParam: 'q',
     authHeader: 'X-Subscription-Token',
-    responseAdapter(data: any) {
-      return (data.web?.results ?? []).map((r: any) => ({
-        title: r.title ?? '',
-        url: r.url ?? '',
-        description: r.description,
-        source: safeHostname(r.url),
-      }))
+    // Brave wants the bare token in X-Subscription-Token, NOT "Bearer <token>".
+    // Empty scheme overrides the default 'Bearer' applied by buildAuthHeadersForPreset.
+    authScheme: '',
+    responseAdapter(data: unknown) {
+      const rec = (data ?? {}) as Record<string, unknown>
+      const web = (rec.web ?? {}) as Record<string, unknown>
+      const rawResults = Array.isArray(web.results) ? web.results : []
+      return (rawResults as unknown[]).map((r) => {
+        const item = (r ?? {}) as Record<string, unknown>
+        const url = typeof item.url === 'string' ? item.url : ''
+        return {
+          title: typeof item.title === 'string' ? item.title : '',
+          url,
+          description: typeof item.description === 'string' ? item.description : undefined,
+          source: url ? safeHostname(url) : undefined,
+        }
+      })
     },
   },
   serpapi: {
@@ -98,13 +144,18 @@ const BUILT_IN_PROVIDERS: Record<string, ProviderPreset> = {
     queryParam: 'q',
     authHeader: 'Authorization',
     authScheme: 'Bearer',
-    responseAdapter(data: any) {
-      return (data.organic_results ?? []).map((r: any) => ({
-        title: r.title ?? '',
-        url: r.link ?? '',
-        description: r.snippet,
-        source: r.displayed_link,
-      }))
+    responseAdapter(data: unknown) {
+      const rec = (data ?? {}) as Record<string, unknown>
+      const rawResults = Array.isArray(rec.organic_results) ? rec.organic_results : []
+      return (rawResults as unknown[]).map((r) => {
+        const item = (r ?? {}) as Record<string, unknown>
+        return {
+          title: typeof item.title === 'string' ? item.title : '',
+          url: typeof item.link === 'string' ? item.link : '',
+          description: typeof item.snippet === 'string' ? item.snippet : undefined,
+          source: typeof item.displayed_link === 'string' ? item.displayed_link : undefined,
+        }
+      })
     },
   },
 }
@@ -118,6 +169,24 @@ const DEFAULT_MAX_BODY_KB = 300
 
 /** Default request timeout in seconds. */
 const DEFAULT_TIMEOUT_SECONDS = 120
+
+/**
+ * Read a positive numeric env override, falling back to `fallback` for
+ * missing, empty, non-finite, or non-positive values.
+ *
+ * `Number(raw) || fallback` alone only rescues 0 and NaN — a negative or
+ * Infinity value is truthy and passes straight through. That silently breaks
+ * the size/timeout guards downstream: a negative WEB_CUSTOM_MAX_BODY_KB makes
+ * the "body exceeds N bytes" check fire for every POST, and a negative
+ * WEB_CUSTOM_TIMEOUT_SEC aborts every request immediately.
+ */
+export function readPositiveEnvNumber(
+  raw: string | undefined,
+  fallback: number,
+): number {
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
 
 /** Header names that are always allowed (case-insensitive). */
 const SAFE_HEADER_NAMES = new Set([
@@ -334,7 +403,7 @@ function auditLogCustomSearch(url: string): void {
     `[web-search] ⚠️  Custom search provider is active. ` +
     `Outbound requests go to: ${safeHostname(url) ?? url}. ` +
     `Ensure this endpoint is trusted. ` +
-    `See: https://github.com/Gitlawb/openclaude/pull/512#security`,
+    `See: https://github.com/Twigpine/openclaude/pull/512#security`,
   )
 }
 
@@ -343,6 +412,13 @@ function auditLogCustomSearch(url: string): void {
 // ---------------------------------------------------------------------------
 
 export function buildAuthHeadersForPreset(preset?: ProviderPreset): Record<string, string> {
+  // Presets that authenticate via a query parameter (e.g. Google's `?key=...`)
+  // do not send an Authorization header. The user can still force a header by
+  // setting WEB_AUTH_HEADER explicitly.
+  if (preset?.authQueryParam && process.env.WEB_AUTH_HEADER === undefined) {
+    return {}
+  }
+
   const apiKey = process.env.WEB_KEY
   if (!apiKey) return {}
 
@@ -354,7 +430,9 @@ export function buildAuthHeadersForPreset(preset?: ProviderPreset): Record<strin
   const scheme = process.env.WEB_AUTH_SCHEME !== undefined
     ? process.env.WEB_AUTH_SCHEME
     : (preset?.authScheme ?? 'Bearer')
-  return { [headerName]: `${scheme} ${apiKey}`.trim() }
+  // Empty scheme → bare key, no leading space (e.g. Brave's X-Subscription-Token)
+  const value = scheme ? `${scheme} ${apiKey}` : apiKey
+  return { [headerName]: value }
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +444,7 @@ function resolveConfig(): {
   queryParam: string
   method: string
   jsonPath?: string
-  responseAdapter?: (data: any) => SearchHit[]
+  responseAdapter?: (data: unknown) => SearchHit[]
   preset?: ProviderPreset
 } {
   const providerName = process.env.WEB_PROVIDER
@@ -398,6 +476,7 @@ function parseExtraParams(): Record<string, string> {
 function buildRequest(query: string) {
   const config = resolveConfig()
   const method = config.method.toUpperCase()
+  const preset = config.preset
 
   // --- URL ---
   const rawTemplate = config.urlTemplate
@@ -414,6 +493,34 @@ function buildRequest(query: string) {
     url.searchParams.set(config.queryParam, query)
   }
 
+  // Preset env-sourced params (e.g. Google's `cx` from GOOGLE_CSE_ID).
+  // Fail fast with a clear error if the named env var isn't set, since the
+  // upstream API will reject the request anyway.
+  if (preset?.envQueryParams) {
+    for (const [paramName, envVar] of Object.entries(preset.envQueryParams)) {
+      const value = process.env[envVar]
+      if (!value) {
+        throw new Error(
+          `Search preset "${process.env.WEB_PROVIDER}" requires environment ` +
+          `variable ${envVar} (used as ?${paramName}=). Set ${envVar} and try again.`,
+        )
+      }
+      url.searchParams.set(paramName, value)
+    }
+  }
+
+  // Preset query-param auth (e.g. Google's `?key=...`).
+  if (preset?.authQueryParam) {
+    const apiKey = process.env.WEB_KEY
+    if (!apiKey) {
+      throw new Error(
+        `Search preset "${process.env.WEB_PROVIDER}" requires WEB_KEY ` +
+        `(sent as ?${preset.authQueryParam}=). Set WEB_KEY and try again.`,
+      )
+    }
+    url.searchParams.set(preset.authQueryParam, apiKey)
+  }
+
   const urlString = url.toString()
 
   // --- Security validation ---
@@ -422,7 +529,7 @@ function buildRequest(query: string) {
 
   // --- Headers ---
   const headers: Record<string, string> = {
-    ...buildAuthHeadersForPreset(config.preset),
+    ...buildAuthHeadersForPreset(preset),
   }
 
   // Merge WEB_HEADERS with allowlist enforcement
@@ -454,7 +561,7 @@ function buildRequest(query: string) {
     const bodyTemplate = process.env.WEB_BODY_TEMPLATE
     if (bodyTemplate) {
       const body = bodyTemplate.replace(/\{query\}/g, query)
-      const maxBodyBytes = (Number(process.env.WEB_CUSTOM_MAX_BODY_KB) || DEFAULT_MAX_BODY_KB) * 1024
+      const maxBodyBytes = readPositiveEnvNumber(process.env.WEB_CUSTOM_MAX_BODY_KB, DEFAULT_MAX_BODY_KB) * 1024
       if (Buffer.byteLength(body) > maxBodyBytes) {
         throw new Error(
           `POST body exceeds ${maxBodyBytes} bytes. ` +
@@ -474,18 +581,18 @@ function buildRequest(query: string) {
 // Response parsing — flexible, handles many shapes
 // ---------------------------------------------------------------------------
 
-function walkJsonPath(obj: any, path: string): any {
-  let current = obj
+function walkJsonPath(obj: unknown, path: string): unknown {
+  let current: unknown = obj
   for (const seg of path.split('.')) {
     if (current == null || typeof current !== 'object') return undefined
-    current = current[seg]
+    current = (current as Record<string, unknown>)[seg]
   }
   return current
 }
 
-function extractFromNode(node: any): SearchHit[] {
+function extractFromNode(node: unknown): SearchHit[] {
   if (!node) return []
-  if (Array.isArray(node)) return node.map(normalizeHit).filter(Boolean) as SearchHit[]
+  if (Array.isArray(node)) return (node as unknown[]).map(normalizeHit).filter(Boolean) as SearchHit[]
   if (typeof node === 'object') {
     const all: SearchHit[] = []
     for (const sub of Object.values(node)) all.push(...extractFromNode(sub))
@@ -495,19 +602,20 @@ function extractFromNode(node: any): SearchHit[] {
   return []
 }
 
-export function extractHits(raw: any, jsonPath?: string): SearchHit[] {
+export function extractHits(raw: unknown, jsonPath?: string): SearchHit[] {
   if (jsonPath) return extractFromNode(walkJsonPath(raw, jsonPath))
-  if (Array.isArray(raw)) return raw.map(normalizeHit).filter(Boolean) as SearchHit[]
+  if (Array.isArray(raw)) return (raw as unknown[]).map(normalizeHit).filter(Boolean) as SearchHit[]
   if (!raw || typeof raw !== 'object') return []
 
   const arrayKeys = ['results', 'items', 'data', 'web', 'organic_results', 'hits', 'entries']
+  const obj = raw as Record<string, unknown>
   for (const key of arrayKeys) {
-    const val = raw[key]
-    if (Array.isArray(val)) return val.map(normalizeHit).filter(Boolean) as SearchHit[]
+    const val = obj[key]
+    if (Array.isArray(val)) return (val as unknown[]).map(normalizeHit).filter(Boolean) as SearchHit[]
     if (val && typeof val === 'object' && !Array.isArray(val)) {
       const all: SearchHit[] = []
-      for (const sub of Object.values(val)) {
-        if (Array.isArray(sub)) all.push(...(sub.map(normalizeHit).filter(Boolean) as SearchHit[]))
+      for (const sub of Object.values(val as Record<string, unknown>)) {
+        if (Array.isArray(sub)) all.push(...((sub as unknown[]).map(normalizeHit).filter(Boolean) as SearchHit[]))
       }
       if (all.length > 0) return all
     }
@@ -520,21 +628,20 @@ export function extractHits(raw: any, jsonPath?: string): SearchHit[] {
 // Fetch with one retry + timeout
 // ---------------------------------------------------------------------------
 
-async function fetchWithRetry(url: string, init: RequestInit, signal?: AbortSignal): Promise<any> {
-  const timeoutSec = Number(process.env.WEB_CUSTOM_TIMEOUT_SEC) || DEFAULT_TIMEOUT_SECONDS
+async function fetchWithRetry(url: string, init: RequestInit, signal?: AbortSignal): Promise<unknown> {
+  const timeoutSec = readPositiveEnvNumber(process.env.WEB_CUSTOM_TIMEOUT_SEC, DEFAULT_TIMEOUT_SECONDS)
   const timeoutMs = timeoutSec * 1000
   let lastErr: Error | undefined
   let lastStatus: number | undefined
 
   for (let attempt = 0; attempt < 2; attempt++) {
-    // Compose timeout with caller signal via AbortSignal.any so each attempt
+    // Compose timeout with caller signal so each attempt
     // has a fresh timeout and we don't leak an abort listener on `signal`
     // (the previous implementation added one per attempt and never removed
     // it, and the listener kept a reference to a stale AbortController).
-    const timeoutSignal = AbortSignal.timeout(timeoutMs)
-    const combined = signal
-      ? AbortSignal.any([signal, timeoutSignal])
-      : timeoutSignal
+    const { signal: combined, cleanup } = createCombinedAbortSignal(signal, {
+      timeoutMs,
+    })
 
     lastStatus = undefined
     try {
@@ -551,8 +658,8 @@ async function fetchWithRetry(url: string, init: RequestInit, signal?: AbortSign
       // Caller-initiated abort wins — propagate without retry or rewrite.
       if (signal?.aborted) throw lastErr
 
-      // Timeout (TimeoutError on Bun/Node, or AbortError with timeoutSignal aborted).
-      if (timeoutSignal.aborted) {
+      // Timeout (TimeoutError on Bun/Node, or AbortError with timeout signal aborted).
+      if (combined.aborted) {
         throw new Error(`Custom search timed out after ${timeoutSec}s`)
       }
 
@@ -562,6 +669,8 @@ async function fetchWithRetry(url: string, init: RequestInit, signal?: AbortSign
         continue
       }
       throw lastErr
+    } finally {
+      cleanup()
     }
   }
   throw lastErr!

@@ -2,15 +2,18 @@ import type { Tool, ToolUseContext } from 'src/Tool.js'
 import z from 'zod/v4'
 import { logForDebugging } from '../debug.js'
 import { lazySchema } from '../lazySchema.js'
+import { requestAbort } from '../interruptionTrace.js'
 import type {
   PermissionDecision,
   PermissionDecisionReason,
 } from './PermissionResult.js'
 import {
-  applyPermissionUpdates,
+  filterPermissionRequestHookUpdates,
   persistPermissionUpdates,
 } from './PermissionUpdate.js'
 import { permissionUpdateSchema } from './PermissionUpdateSchema.js'
+import { applyPermissionUpdatesToLiveContext } from './permissionSetup.js'
+import { revalidatePlanModePermissionAllowWithRaceGuard } from './permissions.js'
 
 export const inputSchema = lazySchema(() =>
   z.object({
@@ -81,36 +84,75 @@ export type Output = z.infer<ReturnType<typeof outputSchema>>
 /**
  * Normalizes the result of a permission prompt tool to a PermissionDecision.
  */
-export function permissionPromptToolResultToPermissionDecision(
+export async function permissionPromptToolResultToPermissionDecision(
   result: Output,
   tool: Tool,
   input: { [key: string]: unknown },
   toolUseContext: ToolUseContext,
-): PermissionDecision {
+): Promise<PermissionDecision> {
   const decisionReason: PermissionDecisionReason = {
     type: 'permissionPromptTool',
     permissionPromptToolName: tool.name,
     toolResult: result,
   }
   if (result.behavior === 'allow') {
-    const updatedPermissions = result.updatedPermissions
-    if (updatedPermissions) {
-      toolUseContext.setAppState(prev => ({
-        ...prev,
-        toolPermissionContext: applyPermissionUpdates(
-          prev.toolPermissionContext,
-          updatedPermissions,
-        ),
-      }))
-      persistPermissionUpdates(updatedPermissions)
-    }
     // Mobile clients responding from a push notification don't have the
     // original tool input, so they send `{}` to satisfy the schema. Treat an
     // empty object as "use original" so the tool doesn't run with no args.
     const updatedInput =
       Object.keys(result.updatedInput).length > 0 ? result.updatedInput : input
+    const planModeWasActive =
+      toolUseContext.getAppState().toolPermissionContext.mode === 'plan'
+    const revalidation =
+      await revalidatePlanModePermissionAllowWithRaceGuard(
+        tool,
+        input,
+        updatedInput,
+        toolUseContext,
+        planModeWasActive,
+      )
+    const enforcePlanMode =
+      planModeWasActive ||
+      toolUseContext.getAppState().toolPermissionContext.mode === 'plan'
+    if (revalidation) {
+      return revalidation
+    }
+
+    const updatedPermissions = filterPermissionRequestHookUpdates(
+      result.updatedPermissions ?? [],
+      enforcePlanMode ||
+        toolUseContext.getAppState().toolPermissionContext.mode === 'plan',
+    )
+    if (updatedPermissions.length > 0) {
+      let updatedContext = toolUseContext.getAppState().toolPermissionContext
+      toolUseContext.setAppState(prev => {
+        updatedContext = applyPermissionUpdatesToLiveContext(
+          prev.toolPermissionContext,
+          updatedPermissions,
+        )
+        if (prev.toolPermissionContext === updatedContext) return prev
+        return {
+          ...prev,
+          toolPermissionContext: updatedContext,
+        }
+      })
+      persistPermissionUpdates(updatedPermissions)
+    }
+    const postUpdatePlanModeDecision =
+      await revalidatePlanModePermissionAllowWithRaceGuard(
+        tool,
+        input,
+        updatedInput,
+        toolUseContext,
+        enforcePlanMode ||
+          toolUseContext.getAppState().toolPermissionContext.mode === 'plan',
+      )
+    if (postUpdatePlanModeDecision) {
+      return postUpdatePlanModeDecision
+    }
+    const { updatedPermissions: _updatedPermissions, ...allowResult } = result
     return {
-      ...result,
+      ...allowResult,
       updatedInput,
       decisionReason,
     }
@@ -118,7 +160,11 @@ export function permissionPromptToolResultToPermissionDecision(
     logForDebugging(
       `SDK permission prompt deny+interrupt: tool=${tool.name} message=${result.message}`,
     )
-    toolUseContext.abortController.abort()
+    requestAbort(toolUseContext.abortController, 'interrupt', {
+      source: 'sdk_permission_interrupt',
+      subsystem: 'tool_permission',
+      controllerRole: 'query-root',
+    })
   }
   return {
     ...result,

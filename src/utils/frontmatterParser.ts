@@ -120,7 +120,40 @@ function quoteProblematicValues(frontmatterText: string): string {
   return result.join('\n')
 }
 
-export const FRONTMATTER_REGEX = /^---\s*\n([\s\S]*?)---\s*\n?/
+/**
+ * The opening delimiter is anchored but the closing one must be too.
+ *
+ * `[\s\S]*?` is lazy, so an unanchored close stops at the first `---` appearing
+ * anywhere -- including in the middle of a value. `description: Reviews code
+ * --- thoroughly` ends the block early: the description is truncated to
+ * "Reviews code", and the rest of the frontmatter plus the real delimiter leak
+ * into the body that is sent to the model. A `---` line inside a block scalar
+ * has the same effect.
+ *
+ * Requiring the captured block to be empty or to end at a line break pins the
+ * close to the start of a line. The `m` flag would do the same for the close
+ * but would also un-anchor the open, letting a horizontal rule partway down a
+ * body be read as frontmatter. Only spaces and tabs may sit between the close
+ * `---` and its line terminator -- letting `\s*` match the terminator itself
+ * accepted a bare `---` with no line ending mid-document.
+ *
+ * Once that terminator (or EOF) is confirmed, the trailing `\s*` consumes the
+ * conventional blank separator line(s) between frontmatter and body, matching
+ * the pre-anchor behavior. Skill and plugin-command bodies are passed into
+ * prompts untrimmed, so leaving that blank line in would prepend a stray
+ * newline to the model instructions. This consumption runs only after a valid
+ * line-terminated close, so it cannot revive the mid-document false close.
+ *
+ * The captured block is lazy at the outer level too (`)??`). A greedy `)?`
+ * consumes one YAML line before trying empty, so empty frontmatter followed by
+ * a body horizontal rule (`---\n---\n---\nBody`) reads the second `---` as YAML
+ * and closes on the third, swallowing the rule into the frontmatter. Preferring
+ * the empty capture closes at the first `---` line, as it did before the block
+ * was anchored, while real frontmatter still matches by taking the non-empty
+ * branch on backtrack.
+ */
+export const FRONTMATTER_REGEX =
+  /^---[ \t]*\r?\n((?:[\s\S]*?\r?\n)??)---[ \t]*(?:\r?\n\s*|$)/
 
 /**
  * Parses markdown content to extract frontmatter and content
@@ -233,33 +266,89 @@ export function splitPathInFrontmatter(input: string | string[]): string[] {
 
 /**
  * Expands brace patterns in a glob string.
+ *
+ * Uses a balance-aware scan to locate the first brace group's matching close
+ * brace, so nested groups expand correctly. Alternatives are split on
+ * top-level commas only — commas nested inside deeper groups belong to those
+ * sub-groups and are preserved until the recursion reaches them.
+ *
+ * Unmatched/unbalanced braces are treated as literal text: the input is
+ * returned unchanged rather than throwing.
+ *
  * @example
  * expandBraces("src/*.{ts,tsx}") // returns ["src/*.ts", "src/*.tsx"]
  * expandBraces("{a,b}/{c,d}") // returns ["a/c", "a/d", "b/c", "b/d"]
+ * expandBraces("{a,{b,c}}") // returns ["a", "b", "c"]
+ * expandBraces("src/**\/*.{js,{ts,tsx}}") // returns ["src/**\/*.js", "src/**\/*.ts", "src/**\/*.tsx"]
  */
 function expandBraces(pattern: string): string[] {
-  // Find the first brace group
-  const braceMatch = pattern.match(/^([^{]*)\{([^}]+)\}(.*)$/)
-
-  if (!braceMatch) {
-    // No braces found, return pattern as-is
+  // Find the first opening brace.
+  const open = pattern.indexOf('{')
+  if (open === -1) {
+    // No braces found, return pattern as-is.
     return [pattern]
   }
 
-  const prefix = braceMatch[1] || ''
-  const alternatives = braceMatch[2] || ''
-  const suffix = braceMatch[3] || ''
+  // Scan forward from the first '{' tracking brace depth to find its matching
+  // '}' (the point where depth returns to 0). Record the top-level comma
+  // positions (depth === 1) so we split alternatives on those only — commas
+  // nested deeper belong to sub-groups and are left for the recursion.
+  let depth = 0
+  let close = -1
+  const topLevelCommas: number[] = []
+  for (let i = open; i < pattern.length; i++) {
+    const char = pattern[i]
+    if (char === '{') {
+      depth++
+    } else if (char === '}') {
+      depth--
+      if (depth === 0) {
+        close = i
+        break
+      }
+    } else if (char === ',' && depth === 1) {
+      topLevelCommas.push(i)
+    }
+  }
 
-  // Split alternatives by comma and expand each one
-  const parts = alternatives.split(',').map(alt => alt.trim())
+  if (close === -1) {
+    // Unbalanced braces (no matching '}'): treat as literal, return unchanged.
+    return [pattern]
+  }
 
-  // Recursively expand remaining braces in suffix
+  if (close === open + 1) {
+    // Empty brace group `{}` is not an alternation. The previous regex required
+    // at least one inner character, so `{}` stayed literal; expanding it to an
+    // empty alternative would collapse `paths: "{}"` to `[""]`, and both
+    // parseSkillPaths and the CLAUDE.md path parser filter that empty string and
+    // treat the file as having NO path restriction (applying everywhere).
+    // Keep the `{}` literal, but still expand any later groups in the suffix.
+    return expandBraces(pattern.slice(close + 1)).map(
+      rest => pattern.slice(0, close + 1) + rest,
+    )
+  }
+
+  const prefix = pattern.slice(0, open)
+  const inner = pattern.slice(open + 1, close)
+  const suffix = pattern.slice(close + 1)
+
+  // Split the inner content on top-level commas (relative to `inner`, whose
+  // indices are offset by open + 1 from the recorded positions).
+  const alternatives: string[] = []
+  let start = 0
+  for (const commaIndex of topLevelCommas) {
+    const rel = commaIndex - (open + 1)
+    alternatives.push(inner.slice(start, rel))
+    start = rel + 1
+  }
+  alternatives.push(inner.slice(start))
+
+  // Recursively expand each option combined with the surrounding prefix/suffix,
+  // which also handles any further brace groups in the suffix.
   const expanded: string[] = []
-  for (const part of parts) {
-    const combined = prefix + part + suffix
-    // Recursively handle additional brace groups
-    const furtherExpanded = expandBraces(combined)
-    expanded.push(...furtherExpanded)
+  for (const alternative of alternatives) {
+    const combined = prefix + alternative.trim() + suffix
+    expanded.push(...expandBraces(combined))
   }
 
   return expanded
@@ -279,9 +368,14 @@ export function parsePositiveIntFromFrontmatter(
     return undefined
   }
 
-  const parsed = typeof value === 'number' ? value : parseInt(String(value), 10)
+  const parsed =
+    typeof value === 'number'
+      ? value
+      : /^\d+$/.test(String(value).trim())
+        ? Number(String(value).trim())
+        : NaN
 
-  if (Number.isInteger(parsed) && parsed > 0) {
+  if (Number.isSafeInteger(parsed) && parsed > 0) {
     return parsed
   }
 

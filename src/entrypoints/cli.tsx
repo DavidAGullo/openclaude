@@ -1,25 +1,26 @@
 import { feature } from 'bun:bundle';
 import {
-  applyProfileEnvToProcessEnv,
-  buildStartupEnvFromProfile,
-} from '../utils/providerProfile.js'
+  BACKGROUND_SESSION_CLEANUP_WORKER_ENV,
+  BACKGROUND_SESSION_ID_ENV,
+  BACKGROUND_SESSION_LAUNCHER_PID_ENV,
+} from '../cli/bgRouting.js'
+import { applyChildProcessHeapOptions } from './applyChildProcessHeapOptions.js'
 import {
-  getProviderValidationError,
-  validateProviderEnvForStartupOrExit,
-} from '../utils/providerValidation.js'
+  argsBeforeModelOwningSubcommand,
+  parseRootOptionValue,
+} from '../utils/printFlag.js'
 
-// OpenClaude: polyfill globalThis.File for Node < 20.
-// undici v7 references `File` at module evaluation time (webidl type
-// assertions). Node 18 lacks the global, causing a ReferenceError inside
-// the bundled __commonJS require chain which deadlocks the process when a
-// proxy is configured (configureGlobalAgents → require_undici).
+// Defensive compatibility guard for environments where globalThis.File is
+// unexpectedly absent. OpenClaude's supported runtime is Node >=22; this is
+// not a Node 18 support guarantee. The guard is harmless on supported Node
+// versions and prevents undici's module evaluation from throwing in unusual
+// embedded/runtime setups.
 // eslint-disable-next-line custom-rules/no-top-level-side-effects
 if (typeof globalThis.File === 'undefined') {
   try {
-    // Node 18.13+ exposes File in node:buffer but not as a global.
+    // Some runtimes expose File in node:buffer but not as a global.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { File: NodeFile } = require('node:buffer')
-    // @ts-expect-error -- polyfilling missing global
     globalThis.File = NodeFile
   } catch {
     // Absolute fallback: stub so `MakeTypeAssertion(File)` doesn't throw.
@@ -47,14 +48,186 @@ process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS ??= 'true'
 // eslint-disable-next-line custom-rules/no-top-level-side-effects
 process.env.COREPACK_ENABLE_AUTO_PIN = '0';
 
-// Set max heap size for child processes in CCR environments (containers have 16GB)
-// eslint-disable-next-line custom-rules/no-top-level-side-effects, custom-rules/no-process-env-top-level, custom-rules/safe-env-boolean-check
-if (process.env.CLAUDE_CODE_REMOTE === 'true') {
-  // eslint-disable-next-line custom-rules/no-top-level-side-effects, custom-rules/no-process-env-top-level
-  const existing = process.env.NODE_OPTIONS || '';
-  // eslint-disable-next-line custom-rules/no-top-level-side-effects, custom-rules/no-process-env-top-level
-  process.env.NODE_OPTIONS = existing ? `${existing} --max-old-space-size=8192` : '--max-old-space-size=8192';
+const SKILLS_LEADING_BOOLEAN_FLAGS = new Set([
+  '--bare',
+  '--debug',
+  '--debug-to-stderr',
+  '--yolo', // alias for --dangerously-skip-permissions
+  '--dangerously-skip-permissions',
+  '--allow-dangerously-skip-permissions',
+  '--disable-slash-commands',
+  '--enable-auth-status',
+  '--fork-session',
+  '--ide',
+  '--include-hook-events',
+  '--include-partial-messages',
+  '--init',
+  '--init-only',
+  '--maintenance',
+  '--mcp-debug',
+  '--no-chrome',
+  '--no-session-persistence',
+  '--replay-user-messages',
+  '--strict-mcp-config',
+  '--verbose',
+])
+
+const SKILLS_LEADING_VALUE_FLAGS = new Set([
+  '--agent',
+  '--append-system-prompt',
+  '--append-system-prompt-file',
+  '--debug-file',
+  '--effort',
+  '--fallback-model',
+  '--heartbeat',
+  '--input-format',
+  '--json-schema',
+  '--max-budget-usd',
+  '--max-thinking-tokens',
+  '--max-turns',
+  '--model',
+  '--output-format',
+  '--permission-mode',
+  '--permission-prompt-tool',
+  '--provider',
+  '--resume-session-at',
+  '--session-id',
+  '--settings',
+  '--setting-sources',
+  '--system-prompt',
+  '--system-prompt-file',
+  '--thinking',
+  '--workload',
+  '-n',
+  '--name',
+])
+
+const SKILLS_LEADING_OPTIONAL_VALUE_FLAGS = new Set([
+  '--continue',
+  '--from-pr',
+  '--print',
+  '-c',
+  '-p',
+  '-r',
+  '--resume',
+])
+
+const SKILLS_LEADING_MULTI_VALUE_FLAGS = new Set([
+  '--add-dir',
+  '--allowedTools',
+  '--allowed-tools',
+  '--betas',
+  '--disallowedTools',
+  '--disallowed-tools',
+  '--file',
+  '--mcp-config',
+  '--plugin-dir',
+  '--provider-env-file',
+  '--tools',
+])
+
+type SkillsCliParseResult = {
+  additionalDirectories: string[]
+  args: string[]
 }
+
+function getSkillsCliArgs(args: string[]): SkillsCliParseResult | undefined {
+  const additionalDirectories: string[] = []
+  let sawPromptModeFlag = false
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]
+    if (arg === 'skills') {
+      if (sawPromptModeFlag) {
+        return undefined
+      }
+      return { additionalDirectories, args: args.slice(index) }
+    }
+    if (SKILLS_LEADING_BOOLEAN_FLAGS.has(arg)) {
+      continue
+    }
+    if (SKILLS_LEADING_MULTI_VALUE_FLAGS.has(arg)) {
+      let consumed = false
+      while (args[index + 1] && !args[index + 1]!.startsWith('-')) {
+        index += 1
+        const value = args[index]
+        if (value === 'skills') {
+          if (sawPromptModeFlag) {
+            return undefined
+          }
+          return {
+            additionalDirectories,
+            args: args.slice(index),
+          }
+        }
+        if (value && arg === '--add-dir') {
+          additionalDirectories.push(value)
+        }
+        consumed = true
+      }
+      if (!consumed) {
+        return undefined
+      }
+      continue
+    }
+    const multiValueEqualsFlag = Array.from(SKILLS_LEADING_MULTI_VALUE_FLAGS)
+      .find(flag => arg?.startsWith(`${flag}=`))
+    if (multiValueEqualsFlag) {
+      const value = arg.slice(`${multiValueEqualsFlag}=`.length)
+      if (!value) {
+        return undefined
+      }
+      if (multiValueEqualsFlag === '--add-dir') {
+        additionalDirectories.push(value)
+      }
+      continue
+    }
+    if (
+      SKILLS_LEADING_VALUE_FLAGS.has(arg) &&
+      args[index + 1] &&
+      !args[index + 1]!.startsWith('-')
+    ) {
+      index += 1
+      continue
+    }
+    if (
+      Array.from(SKILLS_LEADING_VALUE_FLAGS).some(flag =>
+        arg?.startsWith(`${flag}=`),
+      )
+    ) {
+      continue
+    }
+    if (SKILLS_LEADING_OPTIONAL_VALUE_FLAGS.has(arg)) {
+      sawPromptModeFlag = true
+      if (
+        args[index + 1] &&
+        args[index + 1] !== 'skills' &&
+        !args[index + 1]!.startsWith('-')
+      ) {
+        index += 1
+      }
+      continue
+    }
+    if (
+      Array.from(SKILLS_LEADING_OPTIONAL_VALUE_FLAGS).some(flag =>
+        arg?.startsWith(`${flag}=`),
+      )
+    ) {
+      sawPromptModeFlag = true
+      continue
+    }
+    return undefined
+  }
+
+  return undefined
+}
+
+// Set max heap size for child processes. The current CLI process is already
+// running by this point; the package launcher raises its heap before importing
+// dist/cli.mjs. Keeping NODE_OPTIONS here preserves the larger cap for tools or
+// subprocesses spawned after startup without overriding user-provided limits.
+// eslint-disable-next-line custom-rules/no-top-level-side-effects, custom-rules/no-process-env-top-level
+applyChildProcessHeapOptions(process.env, process.execArgv)
 
 // Harness-science L0 ablation baseline. Inlined here (not init.ts) because
 // BashTool/AgentTool/PowerShellTool capture DISABLE_BACKGROUND_TASKS into
@@ -73,52 +246,331 @@ if (feature('ABLATION_BASELINE') && process.env.CLAUDE_CODE_ABLATION_BASELINE) {
  * All imports are dynamic to minimize module evaluation for fast paths.
  * Fast-path for --version has zero imports beyond this file.
  */
-async function main(): Promise<void> {
-  const args = process.argv.slice(2);
+type CliEntrypointOptions = {
+  bgSessionsEnabled?: boolean
+  importers?: Partial<CliEntrypointImporters>
+}
+
+type CliEntrypointImporters = {
+  startupProfiler: () => Promise<typeof import('../utils/startupProfiler.js')>
+  bg: () => Promise<typeof import('../cli/bg.js')>
+  bgFinalizer: () => Promise<typeof import('../cli/bgFinalizer.js')>
+  providerFlag: () => Promise<typeof import('../utils/providerFlag.js')>
+  envFile: () => Promise<typeof import('../utils/envFile.js')>
+  config: () => Promise<typeof import('../utils/config.js')>
+  managedEnv: () => Promise<typeof import('../utils/managedEnv.js')>
+  providerProfile: () => Promise<typeof import('../utils/providerProfile.js')>
+  providerValidation: () => Promise<
+    typeof import('../utils/providerValidation.js')
+  >
+  flagSettings: () => Promise<
+    typeof import('../utils/settings/flagSettings.js')
+  >
+  settingsCache: () => Promise<
+    typeof import('../utils/settings/settingsCache.js')
+  >
+  agentRouting: () => Promise<
+    typeof import('../services/api/agentRouting.js')
+  >
+  settings: () => Promise<typeof import('../utils/settings/settings.js')>
+  cliArgs: () => Promise<typeof import('../utils/cliArgs.js')>
+  githubModelsCredentials: () => Promise<
+    typeof import('../utils/githubModelsCredentials.js')
+  >
+  startupScreen: () => Promise<typeof import('../components/StartupScreen.js')>
+  earlyInput: () => Promise<typeof import('../utils/earlyInput.js')>
+  main: () => Promise<typeof import('../main.js')>
+}
+
+const defaultCliEntrypointImporters: CliEntrypointImporters = {
+  startupProfiler: () => import('../utils/startupProfiler.js'),
+  bg: () => import('../cli/bg.js'),
+  bgFinalizer: () => import('../cli/bgFinalizer.js'),
+  providerFlag: () => import('../utils/providerFlag.js'),
+  envFile: () => import('../utils/envFile.js'),
+  config: () => import('../utils/config.js'),
+  managedEnv: () => import('../utils/managedEnv.js'),
+  providerProfile: () => import('../utils/providerProfile.js'),
+  providerValidation: () => import('../utils/providerValidation.js'),
+  flagSettings: () => import('../utils/settings/flagSettings.js'),
+  settingsCache: () => import('../utils/settings/settingsCache.js'),
+  agentRouting: () => import('../services/api/agentRouting.js'),
+  settings: () => import('../utils/settings/settings.js'),
+  cliArgs: () => import('../utils/cliArgs.js'),
+  githubModelsCredentials: () =>
+    import('../utils/githubModelsCredentials.js'),
+  startupScreen: () => import('../components/StartupScreen.js'),
+  earlyInput: () => import('../utils/earlyInput.js'),
+  main: () => import('../main.js'),
+}
+
+function getCliEntrypointImporters(
+  overrides: Partial<CliEntrypointImporters> | undefined,
+): CliEntrypointImporters {
+  return {
+    ...defaultCliEntrypointImporters,
+    ...overrides,
+  }
+}
+
+function isBgSessionsEnabled(options: CliEntrypointOptions): boolean {
+  if (options.bgSessionsEnabled !== undefined) return options.bgSessionsEnabled
+  if (feature('BG_SESSIONS')) return true
+  return false
+}
+
+export async function main(
+  args: string[] = process.argv.slice(2),
+  options: CliEntrypointOptions = {},
+): Promise<void> {
+  const importers = getCliEntrypointImporters(options.importers)
+  if (process.env[BACKGROUND_SESSION_CLEANUP_WORKER_ENV] === '1') {
+    const { enableConfigs } = await importers.config()
+    enableConfigs()
+    const { eagerLoadSettingsFromArgs } = await importers.flagSettings()
+    const { resetSettingsCache } = await importers.settingsCache()
+    const reloadSettings = () => {
+      resetSettingsCache()
+      return eagerLoadSettingsFromArgs(args).ok
+    }
+    if (!reloadSettings()) return
+    const { runBackgroundSessionCleanupWorker } = await importers.bgFinalizer()
+    await runBackgroundSessionCleanupWorker({ reloadSettings })
+    return
+  }
+  // The detached CLI is the registered background-session PID. Establish
+  // exact registry ownership and install its terminal finalizer before any
+  // fast path or startup validation can call process.exit(). The private env
+  // value only routes this check; the registry's exact ID/PID match is the
+  // authority.
+  if (
+    process.env[BACKGROUND_SESSION_ID_ENV] !== undefined ||
+    process.env[BACKGROUND_SESSION_LAUNCHER_PID_ENV] !== undefined
+  ) {
+    const { prepareBackgroundSessionFinalizer } = await importers.bgFinalizer()
+    await prepareBackgroundSessionFinalizer()
+  }
+
+  const bgSessionsEnabled = isBgSessionsEnabled(options)
+  let reapplyProviderEnvFileValues = () => {}
+  let reapplyProviderFlagValues = () => {}
+  const reapplyExplicitProviderInputs = () => {
+    reapplyProviderEnvFileValues()
+    reapplyProviderFlagValues()
+  }
 
   // Fast-path for --version/-v: zero module loading needed
   if (args.length === 1 && (args[0] === '--version' || args[0] === '-v' || args[0] === '-V')) {
     // MACRO.VERSION is inlined at build time
     // biome-ignore lint/suspicious/noConsole:: intentional console output
-    console.log(`${MACRO.DISPLAY_VERSION ?? MACRO.VERSION} (Open Claude)`);
+    console.log(`${MACRO.DISPLAY_VERSION ?? MACRO.VERSION} (OpenClaude)`);
     return;
+  }
+
+  // Fast-path for `openclaude ps|logs|attach|kill`.
+  // Session management is entirely local, so it should not require config,
+  // profile, credential, provider-validation, or startup-screen work.
+  if (bgSessionsEnabled && (args[0] === 'ps' || args[0] === 'logs' || args[0] === 'attach' || args[0] === 'kill')) {
+    const {
+      profileCheckpoint
+    } = await importers.startupProfiler();
+    profileCheckpoint('cli_bg_path');
+    const bg = await importers.bg();
+    switch (args[0]) {
+      case 'ps':
+        await bg.psHandler(args.slice(1));
+        break;
+      case 'logs':
+        await bg.logsHandler(args.slice(1));
+        break;
+      case 'attach':
+        await bg.attachHandler(args.slice(1));
+        break;
+      case 'kill':
+        {
+          const { enableConfigs } = await importers.config()
+          enableConfigs()
+          const { eagerLoadSettingsFromArgs } = await importers.flagSettings()
+          const retentionSettingsReady = eagerLoadSettingsFromArgs(args).ok
+          await bg.killHandler(args.slice(1), { retentionSettingsReady });
+        }
+        break;
+    }
+    return;
+  }
+
+  // --provider-env-file: Load explicit environment files before any provider resolution.
+  {
+    const {
+      loadEnvFile,
+      parseProviderEnvFileArgs,
+      reapplyRememberedEnvFileValues,
+      rememberLoadedEnvFileValues,
+    } = await importers.envFile()
+    reapplyProviderEnvFileValues = reapplyRememberedEnvFileValues
+    const providerEnvFiles = parseProviderEnvFileArgs(args)
+    if (providerEnvFiles.error) {
+      // biome-ignore lint/suspicious/noConsole:: intentional error output
+      console.error(providerEnvFiles.error)
+      process.exit(1)
+    }
+    for (const filePath of providerEnvFiles.paths) {
+      try {
+        rememberLoadedEnvFileValues(loadEnvFile(filePath))
+      } catch (err: unknown) {
+        // biome-ignore lint/suspicious/noConsole:: intentional error output
+        console.error(err instanceof Error ? err.message : String(err))
+        process.exit(1)
+      }
+    }
   }
 
   // --provider: set provider env vars early so saved-profile resolution,
   // validation, and the startup banner all see the intended provider/model.
-  if (args.includes('--provider')) {
-    const { applyProviderFlagFromArgs } = await import('../utils/providerFlag.js');
-    const result = applyProviderFlagFromArgs(args);
+  let appliedExplicitAnthropic = false
+  const requestedProvider = parseRootOptionValue(args, '--provider')
+  if (requestedProvider) {
+    const {
+      applyProviderFlagFromArgs,
+      reapplyRememberedProviderFlag,
+    } = await importers.providerFlag()
+    reapplyProviderFlagValues = reapplyRememberedProviderFlag
+    const result = applyProviderFlagFromArgs(args, {
+      rememberForSettingsEnv: true,
+    });
     if (result?.error) {
       // biome-ignore lint/suspicious/noConsole:: intentional error output
       console.error(`Error: ${result.error}`);
       process.exit(1);
+    } else if (result && requestedProvider === 'anthropic') {
+      appliedExplicitAnthropic = true
     }
   }
 
   // Enable configs first so we can read settings
   {
-    const { enableConfigs } = await import('../utils/config.js')
+    const { enableConfigs } = await importers.config()
     enableConfigs()
   }
 
   // Apply settings.env from user settings (includes GitHub provider settings from /onboard-github)
   {
-    const { applySafeConfigEnvironmentVariables } = await import('../utils/managedEnv.js')
+    const { applySafeConfigEnvironmentVariables } =
+      await importers.managedEnv()
     applySafeConfigEnvironmentVariables()
   }
+  reapplyExplicitProviderInputs()
 
-  const startupEnv = await buildStartupEnvFromProfile({
-    processEnv: process.env,
-  })
-  if (startupEnv !== process.env) {
-    const startupProfileError = await getProviderValidationError(startupEnv)
-    if (startupProfileError) {
-      console.error(
-        `Warning: ignoring saved provider profile. ${startupProfileError}`,
-      )
-    } else {
-      applyProfileEnvToProcessEnv(process.env, startupEnv)
+  // Local skills management must stay available even when provider startup
+  // configuration is broken, so users can inspect/fix skills from scripts.
+  const skillsCliArgs = getSkillsCliArgs(args)
+  if (skillsCliArgs) {
+    const { setAdditionalDirectoriesForClaudeMd } = await import(
+      '../bootstrap/state.js'
+    )
+    setAdditionalDirectoriesForClaudeMd(skillsCliArgs.additionalDirectories)
+    const { runSkillsCli } = await import('../cli/handlers/skillsCli.js')
+    process.argv = [process.argv[0]!, process.argv[1]!, ...skillsCliArgs.args]
+    await runSkillsCli(skillsCliArgs.args)
+    return
+  }
+
+  // Pass the full argv into the arity-aware scanners. Required-value options
+  // such as --system-prompt consume a following `--` token, so a later root
+  // --model must remain visible. parseRootOptionValue still stops at a real
+  // end-of-options marker that was not consumed as an option value.
+  const modelOptionArgs = argsBeforeModelOwningSubcommand(args)
+  const parsedRootModel =
+    (await importers.providerFlag()).parseModelFlag(modelOptionArgs) ?? undefined
+  const hasRootModelOption = parsedRootModel !== undefined
+
+  const { applyStartupEnvFromProfile } = await importers.providerProfile()
+  let startupProfileWarning: string | undefined
+  // Built-in Anthropic has no positive CLAUDE_CODE_USE_* flag, so process-env
+  // inference cannot preserve an explicit `--provider anthropic` selection.
+  // Other providers retain their existing profile/credential recovery path.
+  const startupProfileError = appliedExplicitAnthropic
+    ? null
+    : await applyStartupEnvFromProfile({
+        processEnv: process.env,
+        modelOverride: parsedRootModel,
+        onValidationError: message => {
+          startupProfileWarning = message
+        },
+      })
+  let startupProfileIsCommandcodeModelError = false
+  if (parsedRootModel && startupProfileError) {
+    const { getCommandcodeChatCompletionsModelError } = await import(
+      '../integrations/gateways/commandcode.js'
+    )
+    startupProfileIsCommandcodeModelError =
+      startupProfileError ===
+      getCommandcodeChatCompletionsModelError(parsedRootModel)
+  }
+  reapplyExplicitProviderInputs()
+
+  // Pane/window teammates are launched as fresh CLI processes. If the parent
+  // selected a configured agentModels key, apply that route before provider
+  // validation and --model env routing run in this child process.
+  let appliedTeammateModel: string | undefined
+  let appliedTeammateProviderOverride = false
+  {
+    const { eagerLoadSettingsFromArgs } = await importers.flagSettings()
+    const settingsLoadResult = eagerLoadSettingsFromArgs(args)
+    if (!settingsLoadResult.ok) {
+      if (settingsLoadResult.cause instanceof Error) {
+        const { logError } = await import('../utils/log.js')
+        logError(settingsLoadResult.cause)
+      }
+      const { default: chalk } = await import('chalk')
+      process.stderr.write(chalk.red(`${settingsLoadResult.message}\n`))
+      process.exit(1)
+    }
+
+    const {
+      applyAgentProviderOverrideToEnv,
+      resolveOutOfProcessTeammateProviderFromCliArgs,
+    } = await importers.agentRouting()
+    const { getInitialSettings } = await importers.settings()
+    const providerOverride = resolveOutOfProcessTeammateProviderFromCliArgs(
+      args,
+      getInitialSettings(),
+    )
+    if (providerOverride) {
+      applyAgentProviderOverrideToEnv(providerOverride)
+      appliedTeammateModel = providerOverride.model
+      appliedTeammateProviderOverride = true
+    }
+  }
+
+  if (
+    startupProfileIsCommandcodeModelError &&
+    !appliedTeammateProviderOverride
+  ) {
+    console.error(`Error: ${startupProfileError}`)
+    process.exit(1)
+    return
+  }
+  if (
+    startupProfileWarning &&
+    !(startupProfileIsCommandcodeModelError && appliedTeammateProviderOverride)
+  ) {
+    console.error(startupProfileWarning)
+  }
+
+  // Fast-path for `--bg`/`--background` after profile routing has been applied
+  // so the spawned child inherits the selected provider/model environment.
+  if (bgSessionsEnabled) {
+    const { argsBeforeDelimiter } = await importers.cliArgs()
+    const optionArgs = argsBeforeDelimiter(args)
+    if (optionArgs.includes('--bg') || optionArgs.includes('--background')) {
+      const {
+        profileCheckpoint
+      } = await importers.startupProfiler();
+      profileCheckpoint('cli_bg_path');
+      const bg = await importers.bg();
+      await bg.handleBgFlag(args);
+      return;
     }
   }
 
@@ -127,21 +579,44 @@ async function main(): Promise<void> {
     const {
       hydrateGithubModelsTokenFromSecureStorage,
       refreshGithubModelsTokenIfNeeded,
-    } = await import('../utils/githubModelsCredentials.js')
+    } = await importers.githubModelsCredentials()
     await refreshGithubModelsTokenIfNeeded()
     hydrateGithubModelsTokenFromSecureStorage()
   }
 
+  // #808: --model alone (no --provider) — route to the env var matching the
+  // active provider before validation and the banner so the highest-precedence
+  // CLI override can replace stale persisted model state.
+  let earlyModelFlag: string | undefined
+  if (hasRootModelOption) {
+    const { applyModelFlagFromArgs } = await importers.providerFlag()
+    earlyModelFlag =
+      appliedTeammateModel ?? parsedRootModel ?? undefined
+    if (!appliedTeammateModel) {
+      const result = applyModelFlagFromArgs(modelOptionArgs)
+      if (result?.error) {
+        console.error(`Error: ${result.error}`)
+        process.exit(1)
+        return
+      }
+    }
+  }
+
+  const { validateProviderEnvForStartupOrExit } =
+    await importers.providerValidation()
   await validateProviderEnvForStartupOrExit()
 
-  // Print the gradient startup screen before the Ink UI loads
-  const { printStartupScreen } = await import('../components/StartupScreen.js')
-  printStartupScreen()
+  // Print the gradient startup screen before the Ink UI loads. Plain CLI
+  // management subcommands should stay script-friendly and avoid the banner.
+  if (args[0] !== 'skills') {
+    const { printStartupScreen } = await importers.startupScreen()
+    printStartupScreen(earlyModelFlag)
+  }
 
   // For all other paths, load the startup profiler
   const {
     profileCheckpoint
-  } = await import('../utils/startupProfiler.js');
+  } = await importers.startupProfiler();
   profileCheckpoint('cli_entry');
 
   // Fast-path for --dump-system-prompt: output the rendered system prompt and exit.
@@ -156,8 +631,7 @@ async function main(): Promise<void> {
     const {
       getMainLoopModel
     } = await import('../utils/model/model.js');
-    const modelIdx = args.indexOf('--model');
-    const model = modelIdx !== -1 && args[modelIdx + 1] || getMainLoopModel();
+    const model = earlyModelFlag ?? getMainLoopModel();
     const {
       getSystemPrompt
     } = await import('../constants/prompts.js');
@@ -276,35 +750,6 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Fast-path for `claude ps|logs|attach|kill` and `--bg`/`--background`.
-  // Session management against the ~/.claude/sessions/ registry. Flag
-  // literals are inlined so bg.js only loads when actually dispatching.
-  if (feature('BG_SESSIONS') && (args[0] === 'ps' || args[0] === 'logs' || args[0] === 'attach' || args[0] === 'kill' || args.includes('--bg') || args.includes('--background'))) {
-    profileCheckpoint('cli_bg_path');
-    const {
-      enableConfigs
-    } = await import('../utils/config.js');
-    enableConfigs();
-    const bg = await import('../cli/bg.js');
-    switch (args[0]) {
-      case 'ps':
-        await bg.psHandler(args.slice(1));
-        break;
-      case 'logs':
-        await bg.logsHandler(args[1]);
-        break;
-      case 'attach':
-        await bg.attachHandler(args[1]);
-        break;
-      case 'kill':
-        await bg.killHandler(args[1]);
-        break;
-      default:
-        await bg.handleBgFlag(args);
-    }
-    return;
-  }
-
   // Fast-path for template job commands.
   if (feature('TEMPLATES') && (args[0] === 'new' || args[0] === 'list' || args[0] === 'reply')) {
     profileCheckpoint('cli_templates_path');
@@ -385,17 +830,19 @@ async function main(): Promise<void> {
   if (process.env.OPENCLAUDE_DISABLE_EARLY_INPUT !== '1') {
     const {
       startCapturingEarlyInput
-    } = await import('../utils/earlyInput.js');
+    } = await importers.earlyInput();
     startCapturingEarlyInput();
   }
   profileCheckpoint('cli_before_main_import');
   const {
     main: cliMain
-  } = await import('../main.js');
+  } = await importers.main();
   profileCheckpoint('cli_after_main_import');
   await cliMain();
   profileCheckpoint('cli_after_main_complete');
 }
 
-// eslint-disable-next-line custom-rules/no-top-level-side-effects
-void main();
+// eslint-disable-next-line custom-rules/no-top-level-side-effects, custom-rules/no-process-env-top-level
+if (process.env.OPENCLAUDE_DISABLE_CLI_ENTRYPOINT_AUTO_RUN !== '1') {
+  await main();
+}

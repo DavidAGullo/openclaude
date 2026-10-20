@@ -7,6 +7,8 @@ import { getTools } from '../tools.js'
 import { getDefaultAppState } from '../state/AppStateStore.js'
 import { AppState } from '../state/AppState.js'
 import { FileStateCache, READ_FILE_STATE_CACHE_SIZE } from '../utils/fileStateCache.js'
+import { getBuiltInAgents } from '../tools/AgentTool/builtInAgents.js'
+import type { Message } from '../types/message.js'
 
 const PROTO_PATH = path.resolve(import.meta.dirname, '../proto/openclaude.proto')
 
@@ -18,14 +20,95 @@ const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
   oneofs: true,
 })
 
-const protoDescriptor = grpc.loadPackageDefinition(packageDefinition) as any
+// proto-loader returns a deeply-nested untyped shape; we only need the AgentService
+// definition from the OpenClaude v1 package, so narrow to that. The implementation
+// map declares the method names; ServiceDefinition<T> requires T to be a record
+// keyed by method name.
+const protoDescriptor = grpc.loadPackageDefinition(packageDefinition) as unknown as {
+  openclaude: {
+    v1: {
+      AgentService: { service: grpc.ServiceDefinition<{ Chat: never }> }
+    }
+  }
+}
 const openclaudeProto = protoDescriptor.openclaude.v1
+
+// Shape of a single client message on the duplex Chat stream. Matches the
+// `oneof` payload in openclaude.proto (ChatRequest | ToolInput | CancelRequest).
+type ClientMessage = {
+  request?: {
+    session_id?: unknown
+    message?: unknown
+    working_directory?: unknown
+    model?: unknown
+  } | null
+  input?: { prompt_id?: unknown; reply?: unknown } | null
+  cancel?: unknown
+}
 
 const MAX_SESSIONS = 1000
 
+type TextDeltaEvent = {
+  type: 'content_block_delta'
+  delta: {
+    type: 'text_delta'
+    text: string
+  }
+}
+
+type TextContentBlock = {
+  type: 'text'
+  text: string
+}
+
+type ToolResultContentBlock = TextContentBlock | Record<string, unknown>
+
+type ToolResultBlock = {
+  type: 'tool_result'
+  tool_use_id: string
+  content?: string | ToolResultContentBlock[]
+  is_error?: boolean
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object'
+}
+
+function isTextDeltaEvent(event: Record<string, unknown>): event is TextDeltaEvent {
+  if (event.type !== 'content_block_delta' || !isRecord(event.delta)) {
+    return false
+  }
+
+  return event.delta.type === 'text_delta' && typeof event.delta.text === 'string'
+}
+
+function isToolResultBlock(block: unknown): block is ToolResultBlock {
+  return (
+    isRecord(block) &&
+    block.type === 'tool_result' &&
+    typeof block.tool_use_id === 'string'
+  )
+}
+
+function isTextContentBlock(block: unknown): block is TextContentBlock {
+  return isRecord(block) && block.type === 'text' && typeof block.text === 'string'
+}
+
+function toolResultContentToString(content: ToolResultBlock['content']): string {
+  if (typeof content === 'string') {
+    return content
+  }
+
+  if (Array.isArray(content)) {
+    return content.map(block => (isTextContentBlock(block) ? block.text : '')).join('\n')
+  }
+
+  return ''
+}
+
 export class GrpcServer {
   private server: grpc.Server
-  private sessions: Map<string, any[]> = new Map()
+  private sessions: Map<string, Message[]> = new Map()
 
   constructor() {
     this.server = new grpc.Server()
@@ -48,7 +131,7 @@ export class GrpcServer {
     )
   }
 
-  private handleChat(call: grpc.ServerDuplexStream<any, any>) {
+  private handleChat(call: grpc.ServerDuplexStream<ClientMessage, unknown>) {
     let engine: QueryEngine | null = null
     let appState: AppState = getDefaultAppState()
     const fileCache: FileStateCache = new FileStateCache(READ_FILE_STATE_CACHE_SIZE, 25 * 1024 * 1024)
@@ -57,7 +140,7 @@ export class GrpcServer {
     const pendingRequests = new Map<string, (reply: string) => void>()
 
     // Accumulated messages from previous turns for multi-turn context
-    let previousMessages: any[] = []
+    let previousMessages: Message[] = []
     let sessionId = ''
     let interrupted = false
 
@@ -90,7 +173,11 @@ export class GrpcServer {
             tools: getTools(appState.toolPermissionContext), // Gets all available tools
             commands: [], // Slash commands
             mcpClients: [],
-            agents: [],
+            // Register OpenClaude's built-in agents (general-purpose,
+            // statusline-setup, optional code-guide). Without this the Agent
+            // tool throws "Agent type 'general-purpose' not found" the moment
+            // the model tries to spawn a subagent for investigation.
+            agents: getBuiltInAgents(),
             ...(previousMessages.length > 0 ? { initialMessages: previousMessages } : {}),
             includePartialMessages: true,
             canUseTool: async (tool, input, context, assistantMsg, toolUseID) => {
@@ -122,7 +209,14 @@ export class GrpcServer {
                   if (reply.toLowerCase() === 'yes' || reply.toLowerCase() === 'y') {
                     resolve({ behavior: 'allow' })
                   } else {
-                    resolve({ behavior: 'deny', reason: 'User denied via gRPC' })
+                    resolve({
+                      behavior: 'deny',
+                      message: 'User denied via gRPC',
+                      decisionReason: {
+                        type: 'other',
+                        reason: 'User denied via gRPC',
+                      },
+                    })
                   }
                 })
               })
@@ -143,7 +237,7 @@ export class GrpcServer {
 
           for await (const msg of generator) {
             if (msg.type === 'stream_event') {
-              if (msg.event.type === 'content_block_delta' && msg.event.delta.type === 'text_delta') {
+              if (isTextDeltaEvent(msg.event)) {
                 call.write({
                   text_chunk: {
                     text: msg.event.delta.text
@@ -156,13 +250,8 @@ export class GrpcServer {
               const content = msg.message.content
               if (Array.isArray(content)) {
                 for (const block of content) {
-                  if (block.type === 'tool_result') {
-                    let outputStr = ''
-                    if (typeof block.content === 'string') {
-                      outputStr = block.content
-                    } else if (Array.isArray(block.content)) {
-                      outputStr = block.content.map(c => c.type === 'text' ? c.text : '').join('\n')
-                    }
+                  if (isToolResultBlock(block)) {
+                    const outputStr = toolResultContentToString(block.content)
                     call.write({
                       tool_result: {
                         tool_name: toolNameById.get(block.tool_use_id) ?? block.tool_use_id,
@@ -194,7 +283,10 @@ export class GrpcServer {
             if (sessionId) {
               if (!this.sessions.has(sessionId) && this.sessions.size >= MAX_SESSIONS) {
                 // Evict oldest session (Map preserves insertion order)
-                this.sessions.delete(this.sessions.keys().next().value)
+                const oldestSessionId = this.sessions.keys().next().value
+                if (oldestSessionId !== undefined) {
+                  this.sessions.delete(oldestSessionId)
+                }
               }
               this.sessions.set(sessionId, previousMessages)
             }
@@ -220,15 +312,15 @@ export class GrpcServer {
         } else if (clientMessage.cancel) {
           interrupted = true
           if (engine) {
-            engine.interrupt()
+            engine.interrupt('grpc_cancel')
           }
           call.end()
         }
-      } catch (err: any) {
+      } catch (err) {
         console.error('Error processing stream')
         call.write({
           error: {
-            message: err.message || "Internal server error",
+            message: err instanceof Error ? err.message : "Internal server error",
             code: "INTERNAL"
           }
         })
@@ -243,7 +335,7 @@ export class GrpcServer {
         resolve('no')
       }
       if (engine) {
-        engine.interrupt()
+        engine.interrupt('grpc_stream_end')
       }
       engine = null
       pendingRequests.clear()

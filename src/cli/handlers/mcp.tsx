@@ -19,7 +19,7 @@ import {
 } from '../../services/mcp/auth.js'
 import { doctorAllServers, doctorServer, type McpDoctorReport, type McpDoctorScopeFilter } from '../../services/mcp/doctor.js';
 import { connectToServer, getMcpServerConnectionBatchSize } from '../../services/mcp/client.js';
-import { addMcpConfig, getAllMcpConfigs, getMcpConfigByName, getMcpConfigsByScope, removeMcpConfig } from '../../services/mcp/config.js';
+import { addMcpConfig, getAllMcpConfigs, getMcpConfigByName, getProjectMcpConfigsFromCwd, removeMcpConfig } from '../../services/mcp/config.js';
 import type { ConfigScope, ScopedMcpServerConfig } from '../../services/mcp/types.js';
 import { describeMcpConfigFilePath, ensureConfigScope, getScopeLabel } from '../../services/mcp/utils.js';
 import { AppStateProvider } from '../../state/AppState.js';
@@ -197,21 +197,24 @@ export async function mcpRemoveHandler(name: string, options: {
       cliOk(`File modified: ${describeMcpConfigFilePath(scope)}`);
     }
 
-    // If no scope specified, check where the server exists
-    const projectConfig = getCurrentProjectConfig();
-    const globalConfig = getGlobalConfig();
-
-    // Check if server exists in project scope (.mcp.json)
-    const {
-      servers: projectServers
-    } = getMcpConfigsByScope('project');
-    const mcpJsonExists = !!projectServers[name];
+    // If no scope specified, check where the server exists. Membership must be
+    // read the same way removeMcpConfig(name, scope) resolves existence: from
+    // the raw, source-filter-independent config for each scope. Using
+    // getMcpConfigsByScope() here would apply the --setting-sources load filter
+    // and report "No MCP server found" for a clean user/local/project entry that
+    // removeMcpConfig still deliberately mutates. These maps are plain objects
+    // from JSON config, so gate every lookup on own-property — a `!!servers[name]`
+    // / `?.[name]` check treats inherited members ('constructor', '__proto__', …)
+    // as present.
+    const localServers = getCurrentProjectConfig().mcpServers ?? {};
+    const userServers = getGlobalConfig().mcpServers ?? {};
+    const { servers: projectServers } = getProjectMcpConfigsFromCwd();
 
     // Count how many scopes contain this server
     const scopes: Array<Exclude<ConfigScope, 'dynamic'>> = [];
-    if (projectConfig.mcpServers?.[name]) scopes.push('local');
-    if (mcpJsonExists) scopes.push('project');
-    if (globalConfig.mcpServers?.[name]) scopes.push('user');
+    if (Object.hasOwn(localServers, name)) scopes.push('local');
+    if (Object.hasOwn(projectServers, name)) scopes.push('project');
+    if (Object.hasOwn(userServers, name)) scopes.push('user');
     if (scopes.length === 0) {
       cliError(`No MCP server found with name: "${name}"`);
     } else if (scopes.length === 1) {
@@ -233,7 +236,7 @@ export async function mcpRemoveHandler(name: string, options: {
       });
       process.stderr.write('\nTo remove from a specific scope, use:\n');
       scopes.forEach(scope => {
-        process.stderr.write(`  claude mcp remove "${name}" -s ${scope}\n`);
+        process.stderr.write(`  openclaude mcp remove "${name}" -s ${scope}\n`);
       });
       cliError();
     }
@@ -250,7 +253,7 @@ export async function mcpListHandler(): Promise<void> {
   } = await getAllMcpConfigs();
   if (Object.keys(configs).length === 0) {
     // biome-ignore lint/suspicious/noConsole:: intentional console output
-    console.log('No MCP servers configured. Use `claude mcp add` to add a server.');
+    console.log('No MCP servers configured. Use `openclaude mcp add` to add a server.');
   } else {
     // biome-ignore lint/suspicious/noConsole:: intentional console output
     console.log('Checking MCP server health...\n');
@@ -374,7 +377,7 @@ export async function mcpGetHandler(name: string): Promise<void> {
     }
   }
   // biome-ignore lint/suspicious/noConsole:: intentional console output
-  console.log(`\nTo remove this server, run: claude mcp remove "${name}" -s ${server.scope}`);
+  console.log(`\nTo remove this server, run: openclaude mcp remove "${name}" -s ${server.scope}`);
   // Use gracefulShutdown to properly clean up MCP server connections
   // (process.exit bypasses cleanup handlers, leaving child processes orphaned)
   await gracefulShutdown(0);
@@ -455,5 +458,5 @@ export async function mcpResetChoicesHandler(): Promise<void> {
     disabledMcpjsonServers: [],
     enableAllProjectMcpServers: false
   }));
-  cliOk('All project-scoped (.mcp.json) server approvals and rejections have been reset.\n' + 'You will be prompted for approval next time you start Claude Code.');
+  cliOk('All project-scoped (.mcp.json) server approvals and rejections have been reset.\n' + 'You will be prompted for approval next time you start OpenClaude.');
 }

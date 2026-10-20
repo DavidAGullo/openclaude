@@ -1,6 +1,5 @@
 import { type StructuredPatchHunk, structuredPatch } from 'diff'
 import { logEvent } from 'src/services/analytics/index.js'
-import { getLocCounter } from '../bootstrap/state.js'
 import { addToTotalLinesChanged } from '../cost-tracker.js'
 import type { FileEdit } from '../tools/FileEditTool/types.js'
 import { count } from './array.js'
@@ -54,8 +53,13 @@ export function countLinesChanged(
   let numRemovals = 0
 
   if (patch.length === 0 && newFileContent) {
-    // For new files, count all lines as additions
-    numAdditions = newFileContent.split(/\r?\n/).length
+    // For new files, count all lines as additions — the way git does. Splitting
+    // on newlines yields a trailing empty element for content that ends in a
+    // newline (the normal case), so a 2-line file "a\nb\n" would otherwise count
+    // as 3. Drop that phantom line when the content is newline-terminated so the
+    // count matches the diff-based update path (and git's own `+` line count).
+    const lines = newFileContent.split(/\r?\n/)
+    numAdditions = /\r?\n$/.test(newFileContent) ? lines.length - 1 : lines.length
   } else {
     numAdditions = patch.reduce(
       (acc, hunk) => acc + count(hunk.lines, _ => _.startsWith('+')),
@@ -68,9 +72,6 @@ export function countLinesChanged(
   }
 
   addToTotalLinesChanged(numAdditions, numRemovals)
-
-  getLocCounter()?.add(numAdditions, { type: 'added' })
-  getLocCounter()?.add(numRemovals, { type: 'removed' })
 
   logEvent('tengu_file_changed', {
     lines_added: numAdditions,
