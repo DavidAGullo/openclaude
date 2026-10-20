@@ -45,7 +45,7 @@
         "duck-duck-scrape": "^2.2.7",
         "emoji-regex": "10.6.0",
         "env-paths": "3.0.0",
-        "eslint": "9",
+        "eslint": "9.39.5",
         "execa": "9.6.1",
         "fflate": "0.8.2",
         "figures": "6.1.0",
