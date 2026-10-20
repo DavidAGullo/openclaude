@@ -36,6 +36,13 @@ export default defineVendor({
       { id: 'deepseek-chat', apiName: 'deepseek-chat', label: 'DeepSeek Chat', modelDescriptorId: 'deepseek-chat' },
       { id: 'deepseek-reasoner', apiName: 'deepseek-reasoner', label: 'DeepSeek Reasoner', modelDescriptorId: 'deepseek-reasoner' },
       {
+        id: 'deepseek-flash',
+        apiName: 'deepseek-flash',
+        label: 'DeepSeek V4.1 Flash',
+        modelDescriptorId: 'deepseek-flash',
+        maxOutputTokens: 393_216,
+      },
+      {
         id: 'deepseek-v4-flash',
         apiName: 'deepseek-v4-flash',
         label: 'DeepSeek V4 Flash',

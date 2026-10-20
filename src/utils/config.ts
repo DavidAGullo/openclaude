@@ -340,13 +340,6 @@ export type GlobalConfig = {
     [tipId: string]: number // Key is tipId, value is the numStartups when tip was last shown
   }
 
-  // Sponsored tip throttling. lastShownAt is numStartups when last sponsored tip
-  // was displayed; used with sponsoredTipsFrequency to enforce a 1-in-N cap.
-  sponsoredTipsHistory?: {
-    lastShownAt: number
-    totalShown: number
-  }
-
   // /buddy companion soul — bones regenerated from userId on read. See src/buddy/.
   companion?: import('../buddy/types.js').StoredCompanion
   companionMuted?: boolean
@@ -435,14 +428,6 @@ export type GlobalConfig = {
 
   // Btw usage tracking
   btwUseCount: number // Number of times user has used /btw
-
-  // Sponsored tips (ads.gitlawb.com) — opt-in earning of opengateway credits.
-  // Managed via the /ads command, NOT /config — intentionally excluded from
-  // GLOBAL_CONFIG_KEYS (the earnCode is a credential, never surfaced in /config).
-  ads?: {
-    enabled: boolean
-    earnCode?: string // issued in the opengateway Earn tab, sent as x-earn-code
-  }
 
   // Plan mode usage tracking
   lastPlanModeUse?: number // Timestamp of last plan mode usage
@@ -792,7 +777,6 @@ export const GLOBAL_CONFIG_KEYS = [
   'diffTool',
   'env',
   'tipsHistory',
-  'sponsoredTipsHistory',
   'todoFeatureEnabled',
   'showExpandedTodos',
   'messageIdleNotifThresholdMs',

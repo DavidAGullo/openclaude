@@ -90,6 +90,34 @@ export const COST_HAIKU_45 = {
 
 export const DEFAULT_UNKNOWN_MODEL_COST = COST_TIER_5_25
 
+// DeepSeek first-party API prices (USD per Mtok) from
+// https://api-docs.deepseek.com/quick_start/pricing. DeepSeek halves these
+// off-peak; we use the peak rates, so cost is a slight overestimate.
+// DeepSeek does not bill cache writes separately (same as cache-miss input).
+export const COST_DEEPSEEK_FLASH = {
+  inputTokens: 0.3,
+  outputTokens: 1.2,
+  promptCacheWriteTokens: 0.3,
+  promptCacheReadTokens: 0.006,
+  webSearchRequests: 0,
+} as const satisfies ModelCosts
+
+export const COST_DEEPSEEK_PRO = {
+  inputTokens: 1.32,
+  outputTokens: 3.96,
+  promptCacheWriteTokens: 1.32,
+  promptCacheReadTokens: 0.044,
+  webSearchRequests: 0,
+} as const satisfies ModelCosts
+
+// Exact ids only: aggregator routes (e.g. OpenRouter's deepseek/...) bill at
+// their own prices.
+const DEEPSEEK_MODEL_COSTS: Record<string, ModelCosts> = {
+  'deepseek-flash': COST_DEEPSEEK_FLASH,
+  'deepseek-v4-flash': COST_DEEPSEEK_FLASH,
+  'deepseek-v4-pro': COST_DEEPSEEK_PRO,
+}
+
 /**
  * Get the cost tier for Opus 4.6 based on fast mode.
  */
@@ -157,6 +185,10 @@ function getKnownModelCosts(
   const override = getModelPricingOverride(model)
   if (override) {
     return override
+  }
+
+  if (Object.hasOwn(DEEPSEEK_MODEL_COSTS, model)) {
+    return DEEPSEEK_MODEL_COSTS[model]
   }
 
   const shortName = getCanonicalName(model)

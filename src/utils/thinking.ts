@@ -137,6 +137,7 @@ export function modelSupportsThinking(model: string): boolean {
   }
   if (
     canonical.startsWith('deepseek-v4-') ||
+    canonical === 'deepseek-flash' ||
     canonical === 'deepseek-reasoner'
   ) {
     return true
